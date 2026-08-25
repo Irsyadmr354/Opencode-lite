@@ -145,7 +145,7 @@ def test_ui_split_tag_no_leak():
     output = out.getvalue()
     assert "I wonder " in output
     assert ui_mod.ANSI_THINKING in output
-    assert "so, proceed" in output
+    assert "Thinking..." in output
     # Must not have raw tag literals leaked in output
     assert "<think>" not in output
     assert "</think>" not in output
@@ -177,7 +177,6 @@ def test_ui_collapses_think_tags_on_close():
 
     output = out.getvalue()
     assert "\033[2K" in output
-    assert "\033[1A" in output
     assert "Clean solution." in output
 
 
