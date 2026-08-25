@@ -58,6 +58,7 @@ ANSI_DIM_CYAN = "\033[2;36m"
 ANSI_WHITE = "\033[37m"
 ANSI_BOLD_WHITE = "\033[1;37m"
 ANSI_THINKING = "\033[3;2;36m"  # italic dim cyan
+SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 PROMPT_PREFIX = f"{ANSI_BOLD_CYAN}⬢ You:{ANSI_RESET} "
 AI_PREFIX = f"{ANSI_BOLD_WHITE}⬡ Assistant:{ANSI_RESET} "
@@ -257,6 +258,7 @@ class TerminalHooks(Hooks):
         self._thinking_active: bool = False
         self._thinking_written: bool = False
         self._thinking_lines: int = 0
+        self._spinner_idx: int = 0
         self._current_tool: tuple[str, str] | None = None
         self._last_char_was_newline: bool = True
         self._at_line_start: bool = True
@@ -321,8 +323,10 @@ class TerminalHooks(Hooks):
         if not self._saw_reasoning:
             self._saw_reasoning = True
             self._thinking_active = True
-            self._write_stdout(THOUGHTS_PREFIX)
+            frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+            self._write_stdout(f"{ANSI_THINKING}{frame} Thinking:{ANSI_RESET}\n")
             self._thinking_written = True
+            self._thinking_lines += 1
         self._write_stdout(f"{ANSI_THINKING}{text}{ANSI_RESET}")
         self._thinking_written = True
         self._thinking_lines += text.count("\n")
@@ -380,16 +384,20 @@ class TerminalHooks(Hooks):
                     flush_cur()
                     self._in_think = True
                     self._thinking_active = True
-                    self._write_stdout(THOUGHTS_PREFIX)
+                    frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+                    self._write_stdout(f"{ANSI_THINKING}{frame} Thinking:{ANSI_RESET}\n")
                     self._thinking_written = True
+                    self._thinking_lines += 1
                     i += 7
                     continue
                 elif lower.startswith("[thinking:"):
                     flush_cur()
                     self._in_bracket = True
                     self._thinking_active = True
-                    self._write_stdout(THOUGHTS_PREFIX)
+                    frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+                    self._write_stdout(f"{ANSI_THINKING}{frame} Thinking:{ANSI_RESET}\n")
                     self._thinking_written = True
+                    self._thinking_lines += 1
                     i += 10
                     continue
 
