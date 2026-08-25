@@ -547,8 +547,8 @@ def _get_help_text() -> str:
         f"\n"
         f"  {ANSI_BOLD}COMMANDS:{ANSI_RESET}\n"
         f"    {ANSI_CYAN}/help{ANSI_RESET}            Display this comprehensive reference guide\n"
-        f"    {ANSI_CYAN}/clear{ANSI_RESET}           Clear terminal screen\n"
-        f"    {ANSI_CYAN}/reset{ANSI_RESET}           Reset conversation memory & start fresh session\n"
+        f"    {ANSI_CYAN}/clear, /reset{ANSI_RESET}   Clear context & conversation memory (fresh start)\n"
+        f"    {ANSI_CYAN}/cls{ANSI_RESET}             Clear terminal screen view\n"
         f"    {ANSI_CYAN}/model [name]{ANSI_RESET}    View active model or switch to another Ollama model on the fly\n"
         f"    {ANSI_CYAN}/status{ANSI_RESET}          Show current workspace, model, base URL, and permissions\n"
         f"    {ANSI_CYAN}/exit, /quit{ANSI_RESET}     Exit opencode-lite\n"
@@ -648,15 +648,15 @@ def run_repl(
             elif cmd in ("/help", "/?", "/h"):
                 _print(_get_help_text())
                 continue
-            elif cmd in ("/clear", "/cls"):
+            elif cmd in ("/cls",):
                 _clear_screen()
                 continue
-            elif cmd in ("/reset", "/restart"):
+            elif cmd in ("/reset", "/restart", "/clear"):
                 if hasattr(agent, "reset"):
                     agent.reset()
                 elif hasattr(agent, "messages"):
                     agent.messages.clear()
-                _print(f"{ANSI_DIM}Session memory reset.{ANSI_RESET}\n")
+                _print(f"{ANSI_DIM}Context & conversation memory cleared.{ANSI_RESET}\n")
                 continue
             elif cmd == "/model":
                 if arg:
