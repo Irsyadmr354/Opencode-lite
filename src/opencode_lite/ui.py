@@ -167,7 +167,10 @@ def _tag_holdback(buffer: str, in_think: bool, at_line_start: bool = False) -> i
     no longer be recognised. Returns how many trailing characters to keep
     buffered (0 when nothing is at risk).
     """
-    candidates: tuple[str, ...] = (_TAG_CLOSER_THINK,) if in_think else _TAG_OPENERS
+    # Always consider both openers and closer, so a partial closer split
+    # across the boundary like "</thin" + "k>" is correctly held even when
+    # the current chunk also contains an opener at its start.
+    candidates: tuple[str, ...] = _TAG_OPENERS + (_TAG_CLOSER_THINK,)
     limit = min(max(len(c) for c in candidates) - 1, len(buffer))
     for h in range(limit, 0, -1):
         tail = buffer[-h:].lower()
@@ -238,9 +241,11 @@ def _parse_thinking_text(text: str, state: dict[str, bool]) -> Text:
 
 
 class TerminalHooks(Hooks):
-    """Pure native terminal hooks for real-time word-by-word streaming, ANSI colors,
-    clean inline tool execution, inline permission prompts, thinking collapse/clear,
-    and red error messages."""
+    """Pure terminal hooks: single-line \\r spinner, no vertical cursor moves.
+    Reasoning preview is shown inline on the spinner line itself (truncated),
+    so the header never needs to be rewritten while the answer streams below.
+    This is the only animation model that is 100% stable on Windows conhost,
+    PowerShell and dumb terminals."""
 
     def __init__(
         self,
@@ -260,12 +265,9 @@ class TerminalHooks(Hooks):
         self._saw_reasoning: bool = False
         self._thinking_active: bool = False
         self._spinner_idx: int = 0
-        self._spinner_frozen: bool = False   # frozen permanently by on_assistant_done
-        self._header_active: bool = False    # Thinking header line currently on screen
-        self._below_started: bool = False    # any text written below the header yet
-        self._below_rows: int = 0            # PHYSICAL rows consumed below the header
-        self._below_col: int = 0             # cursor column within the last physical row
-        self._cursor_on_header: bool = False  # True when cursor is still on the header line itself
+        self._spinner_frozen: bool = False
+        self._header_active: bool = False
+        self._thinking_text: str = ""
         self._current_tool: tuple[str, str] | None = None
         self._last_char_was_newline: bool = True
         self._at_line_start: bool = True
@@ -389,136 +391,62 @@ class TerminalHooks(Hooks):
         self._stderr.write(text)
         self._stderr.flush()
 
-    def _account_text(self, text: str) -> None:
-        """Accumulate PHYSICAL terminal rows consumed by streamed text below the
-        header (soft-wrapped long lines count as ceil(chars/columns) rows, min 1
-        per logical line), so up-moves and erases match what is really on screen."""
-        if not self._header_active or not text:
-            return
-        cols = shutil.get_terminal_size().columns
-        if cols <= 0:
-            cols = 80
-        for idx, seg in enumerate(text.split("\n")):
-            if idx > 0:
-                self._below_rows += 1
-                self._below_col = 0
-            if not seg:
-                continue
-            total = self._below_col + len(seg)
-            self._below_rows += total // cols
-            self._below_col = total % cols
-
-    def _write_reasoning(self, text: str) -> None:
-        """Append reasoning text live on the rows below the header line."""
-        if not text:
-            return
-        prefix = ""
-        if not self._below_started:
-            # Start the text region on the row directly below the header.
-            prefix = "\n"
-            self._below_started = True
-            self._below_rows += 1
-            self._below_col = 0
-            self._cursor_on_header = False
-        self._write_stdout(f"{prefix}{ANSI_THINKING}{text}{ANSI_RESET}")
-        self._account_text(text)
-
     def _begin_header(self) -> None:
-        """Write the single persistent Thinking header line at the cursor."""
         if self._header_active:
             return
         frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
         self._spinner_idx += 1
         self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}")
         self._header_active = True
-        self._cursor_on_header = True
+        self._thinking_text = ""
 
-    def _rewrite_header(self) -> None:
-        """Redraw the Thinking header line in place (spinner advance), preserving
-        streaming cursor. Uses explicit up/down + column restore instead of CSI
-        s/u (save/restore) for Windows conhost compatibility. Graceful
-        degradation: when up-move would meet or exceed screen height, skip."""
+    def _update_header(self) -> None:
         if self._spinner_frozen or not self._header_active:
             return
-        term_lines = shutil.get_terminal_size().lines
-        # Distance from cursor to the header line.
-        if self._cursor_on_header:
-            dist = 0
-        elif self._below_rows == 0:
-            dist = 1
-        else:
-            dist = self._below_rows
-        if dist >= term_lines:
-            return
         frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
-        if dist == 0:
-            self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}")
+        self._spinner_idx += 1
+        preview = self._thinking_text.replace("\n", " ").strip()
+        cols = shutil.get_terminal_size().columns
+        if cols <= 0:
+            cols = 80
+        # header "⠋ Thinking: " ~ 12 chars + preview
+        max_preview = max(0, cols - 22)
+        if preview and max_preview:
+            if len(preview) > max_preview:
+                preview = "…" + preview[-(max_preview-1):]
+            self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking: {preview}{ANSI_RESET}")
         else:
-            # Up to header, rewrite, down to answer row, restore column.
-            self._write_stdout(
-                f"\033[{dist}A\r\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}\033[{dist}B"
-            )
-            if self._below_col:
-                self._write_stdout(f"\033[{self._below_col}C")
+            self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}")
 
     def _collapse_thinking(self, keep_header: bool = True) -> None:
-        """Erase the streamed reasoning TEXT rows only.
-
-        keep_header=True  -> the header line stays visible with its latest
-                             spinner frame (reasoning finished normally).
-        keep_header=False -> also erase the header line (mid-stream abort).
-        """
         if not self._header_active:
             self._saw_reasoning = False
             self._thinking_active = False
             return
-        seq = ANSI_RESET
-        if self._below_started:
-            rows = self._below_rows
-            term_lines = shutil.get_terminal_size().lines
-            if rows > term_lines - 2:
-                # Graceful degradation: never eat scrollback above the viewport.
-                rows = max(0, term_lines - 2)
-            if rows > 0:
-                seq += "\r" + "\033[2K\033[1A" * (rows - 1) + "\033[2K\r"
+        if keep_header:
+            # Freeze to a static dim line above the answer
+            self._write_stdout(f"\r\033[2K{ANSI_DIM}✓ Thinking{ANSI_RESET}\n")
         else:
-            seq += "\n\r"  # reserve the answer row directly below the header
-        if not keep_header:
-            seq += "\033[1A\r\033[2K"
-        self._write_stdout(seq)
+            self._write_stdout(f"\r\033[2K")
         self._thinking_active = False
         self._saw_reasoning = False
-        self._below_started = False
-        self._below_rows = 0
-        self._below_col = 0
-        if not keep_header:
-            self._header_active = False
-            self._cursor_on_header = False
-        else:
-            # Cursor now sits one row below the persistent header.
-            self._cursor_on_header = False
+        self._header_active = False
+        self._thinking_text = ""
         self._last_char_was_newline = True
         self._at_line_start = True
 
     def reset_stream(self) -> None:
-        """Reset internal streaming state cleanly.
-
-        A frozen header from a COMPLETED turn persists on screen untouched;
-        a header from an interrupted (mid-stream abort) stream is erased."""
-        if self._header_active:
-            if not self._spinner_frozen:
-                self._collapse_thinking(keep_header=False)
-            else:
-                self._header_active = False
+        if self._header_active and not self._spinner_frozen:
+            self._collapse_thinking(keep_header=False)
+        elif self._header_active and self._spinner_frozen:
+            # Completed turn's frozen header is already a normal line; just clear state
+            self._header_active = False
         self._in_think = False
         self._in_bracket = False
         self._buffer = ""
         self._saw_reasoning = False
         self._thinking_active = False
-        self._below_started = False
-        self._below_rows = 0
-        self._below_col = 0
-        self._cursor_on_header = False
+        self._thinking_text = ""
         self._spinner_frozen = False
         self._current_tool = None
         self._at_line_start = True
@@ -526,31 +454,24 @@ class TerminalHooks(Hooks):
         self._ai_prefix_printed = False
 
     def on_reasoning(self, text: str) -> None:
-        """Stream native reasoning deltas as live text below the header line."""
         if not text:
             return
         self._saw_reasoning = True
         self._thinking_active = True
         if not self._header_active:
             self._begin_header()
-        else:
-            # Spinner animation follows events only: one frame per reasoning chunk.
-            self._spinner_idx += 1
-            self._rewrite_header()
-        self._write_reasoning(text)
+        # accumulate and refresh single-line preview
+        self._thinking_text += text
+        # cap memory
+        if len(self._thinking_text) > 2000:
+            self._thinking_text = self._thinking_text[-2000:]
+        self._update_header()
 
     def on_delta(self, text: str) -> None:
-        """Real-time word-by-word streaming directly to stdout, collapsing thinking on transition."""
         if not text:
             return
         if self._saw_reasoning or (self._thinking_active and not self._in_think and not self._in_bracket):
-            self._collapse_thinking()
-
-        if self._header_active:
-            # Spinner keeps spinning while the answer streams below the header.
-            self._spinner_frozen = False
-            self._spinner_idx += 1
-            self._rewrite_header()
+            self._collapse_thinking(keep_header=True)
 
         self._buffer += text
         hold = _tag_holdback(self._buffer, self._in_think, self._at_line_start)
@@ -575,41 +496,30 @@ class TerminalHooks(Hooks):
             if cur:
                 joined = "".join(cur)
                 if style:
-                    self._write_reasoning(joined)
+                    # Thinking text -> update single-line preview, not a new line
+                    self._thinking_text += joined
+                    if len(self._thinking_text) > 2000:
+                        self._thinking_text = self._thinking_text[-2000:]
+                    self._update_header()
                 else:
-                    # First answer row below the persistent header must be counted
-                    # (otherwise spinner rewrites with below_rows==0 overwrite the answer).
-                    if self._header_active and not self._below_started:
-                        self._below_started = True
-                        self._below_rows = 1
-                        self._below_col = 0
-                        self._cursor_on_header = False
                     if not self._ai_prefix_printed and not self._in_think and not self._in_bracket:
-                        # Print Assistant prefix right where thinking was collapsed or after tool result
                         clean_check = joined.lstrip("\r\n")
                         if clean_check:
                             self._write_stdout(AI_PREFIX)
                             self._ai_prefix_printed = True
                             joined = clean_check
-                            # Account visible prefix width for physical-row tracking.
-                            self._account_text("⬡ Assistant: ")
                     self._write_stdout(joined)
-                    self._account_text(joined)
                 cur.clear()
 
         while i < n:
             ch = chunk[i]
-
             if not self._in_think and not self._in_bracket:
                 lower = chunk[i:].lower()
                 if lower.startswith("<think>"):
                     flush_cur()
                     self._in_think = True
                     self._thinking_active = True
-                    if self._header_active:
-                        self._spinner_idx += 1
-                        self._rewrite_header()
-                    else:
+                    if not self._header_active:
                         self._begin_header()
                     i += 7
                     continue
@@ -617,46 +527,34 @@ class TerminalHooks(Hooks):
                     flush_cur()
                     self._in_bracket = True
                     self._thinking_active = True
-                    if self._header_active:
-                        self._spinner_idx += 1
-                        self._rewrite_header()
-                    else:
+                    if not self._header_active:
                         self._begin_header()
                     i += 10
                     continue
-
-                # Strip markdown/roleplay asterisks across plain terminal output
                 if ch == "*":
                     if i + 1 < n and chunk[i + 1] == "*":
-                        # Double asterisk bold markdown: **text** -> text
                         i += 2
                         continue
                     elif self._at_line_start and i + 1 < n and chunk[i + 1] == " ":
-                        # Bullet point '* ' -> '- '
                         cur.append("- ")
                         self._at_line_start = False
                         i += 2
                         continue
                     else:
-                        # Single asterisk italic/roleplay: *text* -> text
                         i += 1
                         continue
-
                 if ch == "\n":
                     self._at_line_start = True
                 elif ch != " " and ch != "\r":
                     self._at_line_start = False
-
                 cur.append(ch)
                 i += 1
-
             elif self._in_think:
                 lower = chunk[i:].lower()
                 if lower.startswith("</think>"):
-                    # Flush pending styled buffer BEFORE collapsing (single-chunk leak fix).
                     flush_cur(ANSI_THINKING)
                     self._in_think = False
-                    self._collapse_thinking()
+                    self._collapse_thinking(keep_header=True)
                     i += 8
                 else:
                     cur.append(ch)
@@ -665,7 +563,7 @@ class TerminalHooks(Hooks):
                 if ch == "]":
                     flush_cur(ANSI_THINKING)
                     self._in_bracket = False
-                    self._collapse_thinking()
+                    self._collapse_thinking(keep_header=True)
                     i += 1
                 else:
                     cur.append(ch)
@@ -678,27 +576,20 @@ class TerminalHooks(Hooks):
                 flush_cur()
 
     def on_assistant_done(self, turn: Any) -> None:
-        """Called when the assistant turn completes. Flush buffers, erase pending
-        thinking text (header persists), and freeze the spinner permanently."""
         if self._buffer:
             buf = self._buffer
             self._buffer = ""
             self._render_chunk(buf)
-
         if self._in_think or self._in_bracket or self._saw_reasoning or self._thinking_active:
-            self._collapse_thinking()
+            self._collapse_thinking(keep_header=True)
             self._in_think = False
             self._in_bracket = False
-
-        # Freeze the spinner: no further header rewrites after this point.
         self._spinner_frozen = True
         self._at_line_start = True
         self._in_roleplay_asterisk = False
         self._ai_prefix_printed = False
-
         if not self._last_char_was_newline:
             self._write_stdout("\n")
-
         if getattr(self, "verbose", False):
             try:
                 line = self._format_verbose(turn)

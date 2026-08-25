@@ -1,8 +1,7 @@
-"""Thinking/reasoning support: field capture (llm) + split-tag-safe UI."""
+"""Thinking/reasoning support: field capture (llm) + split-tag-safe UI (single-line \\r)."""
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,13 +12,13 @@ for _p in (str(_ROOT / "src"), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from fake_ollama import FakeOllama  # noqa: E402
+from fake_ollama import FakeOllama
 
-import opencode_lite.ui as ui_mod  # noqa: E402
-from opencode_lite.agent import Agent, Hooks  # noqa: E402
-from opencode_lite.config import load_config  # noqa: E402
-from opencode_lite.llm import LLMClient  # noqa: E402
-from opencode_lite.tools import get_tools  # noqa: E402
+import opencode_lite.ui as ui_mod
+from opencode_lite.agent import Agent, Hooks
+from opencode_lite.config import load_config
+from opencode_lite.llm import LLMClient
+from opencode_lite.tools import get_tools
 
 
 def _collect(base_url: str, **kw):
@@ -103,52 +102,46 @@ def test_agent_forwards_reasoning_events(tmp_path):
     assert "".join(hooks.deltas) == "done"
 
 
-# --- split-tag holdback ------------------------------------------------------
-
 def test_tag_holdback_units():
     f = ui_mod._tag_holdback
-    assert f("<thi", False) == 4            # partial opener held back
-    assert f("hello</thin", True) == 6      # partial closer while inside think
-    assert f("</think>", True) == 0         # complete token -> parser handles it
-    assert f("<think>", False) == 0         # complete token
+    assert f("<thi", False) == 4
+    assert f("hello</thin", True) == 6
+    assert f("</think>", True) == 0
+    assert f("<think>", False) == 0
     assert f("abc<", False) == 1
     assert f("plain text!", False) == 0
-    assert f("[thinkin", False) == 8        # partial bracket opener
+    assert f("[thinkin", False) == 8
 
-
-# --- TerminalHooks UI rendering ----------------------------------------------
 
 import io
 import os
 
 
 def _term(monkeypatch, cols: int, lines: int) -> None:
-    """Force a deterministic terminal geometry for physical-row accounting."""
     monkeypatch.setattr(ui_mod.shutil, "get_terminal_size", lambda: os.terminal_size((cols, lines)))
 
 
 def test_ui_renders_reasoning_field():
-    """Native reasoning deltas must stream TEXT live below a persistent header."""
+    """Native reasoning deltas stream as single-line preview, header collapses to static."""
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
     frame0 = ui_mod.SPINNER_FRAMES[0]
 
     hooks.on_reasoning("thinking hard\nabout it")
     output = out.getvalue()
-    assert f"{frame0} Thinking" in output                    # header line
-    assert ui_mod.ANSI_THINKING + "thinking hard" in output  # reasoning text streamed
+    assert f"{frame0} Thinking" in output
+    # preview is inline on header line, newlines become spaces
+    assert "thinking hard" in output
     assert "about it" in output
 
     hooks.on_delta("answer here")
     output = out.getvalue()
-    # Exactly the 2 physical reasoning rows are erased; the header stays.
-    assert "\r\033[2K\033[1A\033[2K\r" in output
-    assert ui_mod.SPINNER_FRAMES[2] + " Thinking" in output  # spinner advanced on delta
+    # collapse writes static checkmark header with newline, no vertical moves
+    assert "✓ Thinking" in output
+    assert "\033[1A" not in output  # no vertical cursor moves
     assert "answer here" in output
-    assert "\033[1A" in output and "\033[1B" in output       # explicit up/down restore (no save/restore)
-
-    hooks.on_assistant_done(
-        SimpleNamespace(content="answer here", reasoning="thinking hard\nabout it"))
+    # spinner frozen after done
+    hooks.on_assistant_done(SimpleNamespace(content="answer here", reasoning="thinking hard\nabout it"))
     assert hooks._spinner_frozen is True
 
 
@@ -162,119 +155,113 @@ def test_ui_split_tag_no_leak():
 
     output = out.getvalue()
     assert "I wonder " in output
-    assert ui_mod.ANSI_THINKING + "secret plan" in output    # think body rendered styled
-    assert "\r\033[2K\r" in output                           # its single physical row erased
-    assert ui_mod.AI_PREFIX in output                        # answer follows persisted header
-    assert ui_mod.SPINNER_FRAMES[0] + " Thinking" in output  # header survives collapse
+    assert "secret plan" in output  # preview contains it
+    assert "✓ Thinking" in output  # header collapsed
+    assert ui_mod.AI_PREFIX in output
     assert "so, proceed" in output
-    # Must not have raw tag literals leaked in output
     assert "<think>" not in output
     assert "</think>" not in output
 
 
 def test_ui_collapses_thinking_on_transition_to_content():
-    """Reasoning text is rendered live, then erased physically when content starts."""
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
     hooks.on_reasoning("analyzing the code\nfinding bugs")
-    assert "analyzing the code" in out.getvalue()            # live reasoning TEXT
+    assert "analyzing the code" in out.getvalue()
     assert "finding bugs" in out.getvalue()
 
     hooks.on_delta("Here is the fix.")
     hooks.on_assistant_done(SimpleNamespace(content="Here is the fix."))
 
     output = out.getvalue()
-    assert "\r\033[2K\033[1A\033[2K\r" in output             # both physical rows erased
-    assert ui_mod.SPINNER_FRAMES[0] + " Thinking" in output  # header kept, not wiped
-    assert ui_mod.SPINNER_FRAMES[2] + " Thinking" in output  # and still animating
+    assert "✓ Thinking" in output
+    assert "\033[1A" not in output
     assert "Here is the fix." in output
 
 
 def test_ui_single_chunk_think_no_plain_leak():
-    """<think>...</think> inside ONE chunk must never re-flush as plain answer."""
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
     hooks.on_delta("<think>secret plan</think>Visible answer.")
     hooks.on_assistant_done(SimpleNamespace(content="<think>secret plan</think>Visible answer."))
 
     output = out.getvalue()
-    assert ui_mod.ANSI_THINKING + "secret plan" in output    # flushed styled BEFORE collapse
-    assert output.count("secret plan") == 1                  # exactly once, never plain
-    assert "\033[2K" in output                               # reasoning rows erased
-    assert ui_mod.AI_PREFIX in output                        # real answer starts fresh
+    assert "secret plan" in output
+    # preview appears once via header, not as plain answer
+    assert output.count("secret plan") == 1
+    assert "✓ Thinking" in output
+    assert ui_mod.AI_PREFIX in output
     assert "Visible answer." in output
 
 
 def test_ui_physical_rows_wrap_erase(monkeypatch):
-    """Soft-wrapped long reasoning consumes ceil(chars/columns) physical rows."""
+    """Long reasoning is truncated to terminal width, not multi-row erase."""
     _term(monkeypatch, cols=40, lines=24)
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
-    # 100 chars at 40 cols -> 1 leading row + 2 wrapped rows = 3 physical rows.
     hooks.on_delta("<think>" + "x" * 100 + "</think>Answer.")
     hooks.on_assistant_done(SimpleNamespace(content="<think>" + "x" * 100 + "</think>Answer."))
 
     output = out.getvalue()
-    assert ui_mod.ANSI_THINKING + "x" * 100 in output
-    # 3-row erase = two (clear+up) steps plus final clear, ending on answer row.
-    assert "\r\033[2K\033[1A\033[2K\033[1A\033[2K\r" in output
+    # preview truncated with ellipsis, not full 100 x's
+    assert "…" in output
+    assert "✓ Thinking" in output
     assert "Answer." in output
+    assert "\033[1A" not in output
 
 
 def test_ui_collapses_bracket_thinking_on_close():
-    """[thinking: ...] streams styled text, erases it, keeps the header on ']'."""
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
     hooks.on_delta("[thinking: quick thoughts]Ready.")
     hooks.on_assistant_done(SimpleNamespace(content="[thinking: quick thoughts]Ready."))
 
     output = out.getvalue()
-    assert ui_mod.ANSI_THINKING + " quick thoughts" in output  # opener tag consumed w/ space
-    assert "\r\033[2K\r" in output
-    assert ui_mod.SPINNER_FRAMES[0] + " Thinking" in output  # header survives
+    assert "quick thoughts" in output
+    assert "✓ Thinking" in output
     assert ui_mod.AI_PREFIX in output
     assert "Ready." in output
 
 
 def test_ui_spinner_guard_tiny_viewport(monkeypatch):
-    """Up-moves that would meet/exceed screen height are suppressed, erases clamped."""
+    """Tiny viewport must not crash; single-line spinner never needs vertical moves."""
     _term(monkeypatch, cols=40, lines=5)
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
-    hooks.on_reasoning("a\nb\nc\nd\ne\nf")                  # 7 physical rows > 5-line screen
-    hooks.on_reasoning("more")                              # would need an up-move -> guarded
+    hooks.on_reasoning("a\nb\nc\nd\ne\nf")
+    hooks.on_reasoning("more")
     output = out.getvalue()
-    assert output.count(ui_mod.SPINNER_FRAMES[0] + " Thinking") == 1  # no rewrite emitted
-    assert "\033[s" not in output                                     # cursor untouched
+    # header appears, but no vertical moves ever
+    assert "Thinking" in output
+    assert "\033[1A" not in output
+    assert "\033[s" not in output
 
     hooks.on_delta("A")
     hooks.on_assistant_done(SimpleNamespace(content="A"))
     output = out.getvalue()
-    # Erase clamped to lines-2 = 3 rows: exactly two up-moves for erase + one for header rewrite.
-    assert "\r\033[2K\033[1A\033[2K\033[1A\033[2K\r" in output
-    assert output.count("\033[1A") == 3
+    assert "✓ Thinking" in output
+    assert "\033[1A" not in output
     assert "A" in output
 
 
 def test_ui_spinner_freezes_on_done():
-    """Spinner advances while the answer streams, freezes permanently on done."""
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
     hooks.on_reasoning("x")
     hooks.on_delta("ans")
     output = out.getvalue()
-    assert ui_mod.SPINNER_FRAMES[2] + " Thinking" in output  # spun during answer phase
-    assert "\033[1A" in output and "\033[1B" in output       # explicit up/down header redraws
+    assert "✓ Thinking" in output
+    # single-line mode: no save/restore, just \r
+    assert "\r\033[2K" in output
 
     hooks.on_assistant_done(SimpleNamespace(content="ans"))
     snapshot = out.getvalue()
     assert hooks._spinner_frozen is True
-    hooks._rewrite_header()                                  # frozen: must be a no-op
-    assert out.getvalue() == snapshot                        # zero further rewrites
+    hooks._update_header()
+    assert out.getvalue() == snapshot
 
 
 def test_ui_plain_model_output_identical():
-    """Models that never reason produce byte-identical output to the legacy path."""
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
     hooks.on_delta("Just answer.")
@@ -283,14 +270,10 @@ def test_ui_plain_model_output_identical():
     output = out.getvalue()
     assert output == ui_mod.AI_PREFIX + "Just answer." + "\n"
     assert "Thinking" not in output
-    assert "\033[s" not in output
     assert "\033[1A" not in output
-    assert "\033[2K" not in output
 
 
 def test_ui_reset_stream_semantics():
-    """reset_stream: completed turn keeps its frozen header; aborted stream cleans up."""
-    # Completed turn: frozen header persists, state cleared, screen untouched.
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
     hooks.on_reasoning("t")
@@ -303,14 +286,10 @@ def test_ui_reset_stream_semantics():
     assert hooks._spinner_frozen is False
     assert hooks._buffer == ""
 
-    # Mid-stream abort (e.g. Ctrl+C): erase reasoning rows AND the header itself.
     out2 = io.StringIO()
     hooks2 = ui_mod.TerminalHooks(stdout=out2)
     hooks2.on_reasoning("t")
     hooks2.reset_stream()
     output2 = out2.getvalue()
-    assert "\r\033[2K\r" in output2                          # reasoning row erased
-    assert "\033[1A\r\033[2K" in output2                     # header line erased too
+    assert "\r\033[2K" in output2
     assert hooks2._header_active is False
-
-
