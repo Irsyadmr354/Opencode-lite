@@ -464,6 +464,7 @@ class TerminalHooks(Hooks):
         # Immediate feedback: show spinner instantly, animate in background
         if self._header_active:
             return
+        self._spinner_frozen = False
         self._saw_reasoning = True
         self._thinking_active = True
         self._begin_header()
