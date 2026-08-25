@@ -258,10 +258,6 @@ class TerminalHooks(Hooks):
         self._thinking_active: bool = False
         self._thinking_written: bool = False
         self._thinking_lines: int = 0
-        self._spinner_idx: int = 0
-        self._spinner_thread: threading.Thread | None = None
-        self._spinner_stop_event = threading.Event()
-        self._spinner_lock = threading.Lock()
         self._current_tool: tuple[str, str] | None = None
         self._last_char_was_newline: bool = True
         self._at_line_start: bool = True
@@ -272,55 +268,29 @@ class TerminalHooks(Hooks):
     def _write_stdout(self, text: str) -> None:
         if not text:
             return
-        with self._spinner_lock:
-            self._stdout.write(text)
-            self._stdout.flush()
-            self._last_char_was_newline = text.endswith("\n")
+        self._stdout.write(text)
+        self._stdout.flush()
+        self._last_char_was_newline = text.endswith("\n")
 
     def _write_stderr(self, text: str) -> None:
         if not text:
             return
-        with self._spinner_lock:
-            self._stderr.write(text)
-            self._stderr.flush()
-
-    def _start_spinner(self) -> None:
-        if self._spinner_thread is not None and self._spinner_thread.is_alive():
-            return
-        self._spinner_stop_event.clear()
-
-        def _spin():
-            import time
-            while not self._spinner_stop_event.is_set():
-                frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
-                self._spinner_idx += 1
-                with self._spinner_lock:
-                    if self._thinking_active:
-                        self._stdout.write(f"\r\033[2K{ANSI_THINKING}{frame} Thinking...{ANSI_RESET}")
-                        self._stdout.flush()
-                time.sleep(0.08)
-
-        self._spinner_thread = threading.Thread(target=_spin, daemon=True)
-        self._spinner_thread.start()
-
-    def _stop_spinner(self) -> None:
-        self._spinner_stop_event.set()
-        if self._spinner_thread is not None and self._spinner_thread.is_alive():
-            self._spinner_thread.join(timeout=0.2)
-        self._spinner_thread = None
+        self._stderr.write(text)
+        self._stderr.flush()
 
     def _collapse_thinking(self) -> None:
         """Collapse and erase streamed thinking from the terminal screen."""
-        self._stop_spinner()
         if not self._thinking_active and not self._saw_reasoning:
             return
-        with self._spinner_lock:
-            # Clear current thinking line
-            self._stdout.write(f"\r\033[2K{ANSI_RESET}")
+        if self._thinking_written:
+            # Clear current line
+            erase_seq = "\r\033[2K"
             if self._thinking_lines > 0:
-                self._stdout.write("\033[1A\033[2K" * self._thinking_lines)
-            self._stdout.write("\r")
-            self._stdout.flush()
+                erase_seq += "\033[1A\033[2K" * self._thinking_lines
+            erase_seq += "\r"
+            self._write_stdout(f"{ANSI_RESET}{erase_seq}")
+        else:
+            self._write_stdout(ANSI_RESET)
 
         self._thinking_active = False
         self._saw_reasoning = False
@@ -331,7 +301,6 @@ class TerminalHooks(Hooks):
 
     def reset_stream(self) -> None:
         """Reset internal streaming state cleanly."""
-        self._stop_spinner()
         self._collapse_thinking()
         self._in_think = False
         self._in_bracket = False
@@ -346,15 +315,13 @@ class TerminalHooks(Hooks):
         self._ai_prefix_printed = False
 
     def on_reasoning(self, text: str) -> None:
-        """Real-time streaming for dedicated reasoning field with spinning frame."""
+        """Real-time streaming for dedicated reasoning field in italic dim cyan."""
         if not text:
             return
         if not self._saw_reasoning:
             self._saw_reasoning = True
             self._thinking_active = True
-            frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
-            self._spinner_idx += 1
-            self._write_stdout(f"{ANSI_THINKING}{frame} Thinking:{ANSI_RESET}\n")
+            self._write_stdout(f"{ANSI_THINKING}⠋ Thinking:{ANSI_RESET}\n")
             self._thinking_written = True
             self._thinking_lines += 1
         self._write_stdout(f"{ANSI_THINKING}{text}{ANSI_RESET}")
@@ -414,16 +381,18 @@ class TerminalHooks(Hooks):
                     flush_cur()
                     self._in_think = True
                     self._thinking_active = True
-                    self._start_spinner()
+                    self._write_stdout(f"{ANSI_THINKING}⠋ Thinking:{ANSI_RESET}\n")
                     self._thinking_written = True
+                    self._thinking_lines += 1
                     i += 7
                     continue
                 elif lower.startswith("[thinking:"):
                     flush_cur()
                     self._in_bracket = True
                     self._thinking_active = True
-                    self._start_spinner()
+                    self._write_stdout(f"{ANSI_THINKING}⠋ Thinking:{ANSI_RESET}\n")
                     self._thinking_written = True
+                    self._thinking_lines += 1
                     i += 10
                     continue
 
