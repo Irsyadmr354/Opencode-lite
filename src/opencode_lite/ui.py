@@ -32,6 +32,68 @@ RESULT_PREVIEW_CHARS = 300
 ARGS_PREVIEW_LINES = 30
 
 
+THINKING_STYLE = "italic dim cyan"
+
+
+def _parse_thinking_text(text: str, state: dict[str, bool]) -> Text:
+    """Parse text into a Rich Text object, highlighting <think>...</think>
+    and [Thinking:...] sections in italic dim cyan/gray."""
+    res = Text()
+    i = 0
+    n = len(text)
+    cur = ""
+
+    while i < n:
+        if not state.get("in_think") and not state.get("in_bracket"):
+            lower = text[i:].lower()
+            if lower.startswith("<think>"):
+                if cur:
+                    res.append(cur)
+                    cur = ""
+                state["in_think"] = True
+                cur += text[i : i + 7]
+                i += 7
+            elif lower.startswith("[thinking:"):
+                if cur:
+                    res.append(cur)
+                    cur = ""
+                state["in_bracket"] = True
+                cur += text[i : i + 10]
+                i += 10
+            else:
+                cur += text[i]
+                i += 1
+        elif state.get("in_think"):
+            lower = text[i:].lower()
+            if lower.startswith("</think>"):
+                cur += text[i : i + 8]
+                res.append(cur, style=THINKING_STYLE)
+                cur = ""
+                state["in_think"] = False
+                i += 8
+            else:
+                cur += text[i]
+                i += 1
+        elif state.get("in_bracket"):
+            if text[i] == "]":
+                cur += "]"
+                res.append(cur, style=THINKING_STYLE)
+                cur = ""
+                state["in_bracket"] = False
+                i += 1
+            else:
+                cur += text[i]
+                i += 1
+
+    if cur:
+        if state.get("in_think") or state.get("in_bracket"):
+            res.append(cur, style=THINKING_STYLE)
+        else:
+            res.append(cur)
+
+    return res
+
+
 def _compact_json(args: Any) -> str:
     try:
         return json.dumps(args, separators=(",", ":"), default=str)
@@ -175,15 +237,44 @@ class ChatApp(App[None]):
             def __init__(self) -> None:
                 super().__init__()
                 self._current_delta_parts: list[str] = []
+                self._line_buffer: str = ""
+                self._think_state: dict[str, bool] = {"in_think": False, "in_bracket": False}
+
+            def _flush_line(self, line: str) -> None:
+                rendered = _parse_thinking_text(line, self._think_state)
+                outer._ui(lambda r=rendered: outer._chat().write(r))
 
             def on_delta(self, text: str) -> None:
                 self._current_delta_parts.append(text)
+                self._line_buffer += text
+
+                if "\n" in self._line_buffer:
+                    lines = self._line_buffer.split("\n")
+                    for line in lines[:-1]:
+                        self._flush_line(line)
+                    self._line_buffer = lines[-1]
+
+                while len(self._line_buffer) > 80:
+                    idx = self._line_buffer[:80].rfind(" ")
+                    if idx != -1:
+                        chunk = self._line_buffer[:idx]
+                        self._line_buffer = self._line_buffer[idx + 1 :]
+                        self._flush_line(chunk)
+                    else:
+                        break
 
             def on_assistant_done(self, turn: Any) -> None:
-                full_text = "".join(self._current_delta_parts).strip()
+                if self._line_buffer:
+                    line = self._line_buffer
+                    self._line_buffer = ""
+                    self._flush_line(line)
+                elif not self._current_delta_parts and getattr(turn, "content", None):
+                    self._flush_line(str(turn.content))
+
+                if self._current_delta_parts or getattr(turn, "content", None):
+                    outer._ui(lambda: outer._chat().write(Text("")))
                 self._current_delta_parts.clear()
-                if full_text:
-                    outer._ui(lambda: outer._chat().write(Text(full_text + "\n")))
+                self._think_state = {"in_think": False, "in_bracket": False}
 
             def on_tool_start(self, name: str, args: dict) -> None:
                 line = Text(f">> {name} {_compact_json(args)}", style="dim cyan")

@@ -24,7 +24,8 @@ SYSTEM_PROMPT = (
     "2. Always read_file or list_files before editing; never guess file contents.\n"
     "3. Prefer surgical edits; rewrite whole files only when necessary.\n"
     "4. Paths are relative to the workspace root.\n"
-    "5. When calling tools, emit valid function calls. When done, summarize findings concisely."
+    "5. When calling tools, emit valid function calls. When done, summarize findings concisely.\n"
+    "6. You may include concise <think> reasoning thoughts </think> before taking action or answering."
 )
 
 
