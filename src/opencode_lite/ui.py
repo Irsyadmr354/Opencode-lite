@@ -59,7 +59,9 @@ ANSI_WHITE = "\033[37m"
 ANSI_BOLD_WHITE = "\033[1;37m"
 ANSI_THINKING = "\033[3;2;36m"  # italic dim cyan
 
-PROMPT_PREFIX = f"{ANSI_BOLD_CYAN}>{ANSI_RESET} "
+PROMPT_PREFIX = f"{ANSI_BOLD_CYAN}[YOU]:{ANSI_RESET} "
+AI_PREFIX = f"{ANSI_BOLD_WHITE}[AI]:{ANSI_RESET} "
+THOUGHTS_PREFIX = f"{ANSI_THINKING}[Thoughts]:{ANSI_RESET} "
 
 
 def _compact_json(args: Any) -> str:
@@ -259,6 +261,7 @@ class TerminalHooks(Hooks):
         self._last_char_was_newline: bool = True
         self._at_line_start: bool = True
         self._in_roleplay_asterisk: bool = False
+        self._ai_prefix_printed: bool = False
         self.had_error: bool = False
 
     def _write_stdout(self, text: str) -> None:
@@ -309,6 +312,7 @@ class TerminalHooks(Hooks):
         self._current_tool = None
         self._at_line_start = True
         self._in_roleplay_asterisk = False
+        self._ai_prefix_printed = False
 
     def on_reasoning(self, text: str) -> None:
         """Real-time streaming for dedicated reasoning/reasoning_content field in italic dim cyan."""
@@ -317,8 +321,9 @@ class TerminalHooks(Hooks):
         if not self._saw_reasoning:
             self._saw_reasoning = True
             self._thinking_active = True
-            self._write_stdout(ANSI_THINKING)
-        self._write_stdout(text)
+            self._write_stdout(THOUGHTS_PREFIX)
+            self._thinking_written = True
+        self._write_stdout(f"{ANSI_THINKING}{text}{ANSI_RESET}")
         self._thinking_written = True
         self._thinking_lines += text.count("\n")
 
@@ -357,6 +362,12 @@ class TerminalHooks(Hooks):
                         self._thinking_written = True
                         self._thinking_lines += joined.count("\n")
                 else:
+                    if not self._ai_prefix_printed and not self._in_think and not self._in_bracket:
+                        # Print [AI]: prefix before first content token
+                        clean_check = joined.lstrip()
+                        if clean_check:
+                            self._write_stdout(AI_PREFIX)
+                            self._ai_prefix_printed = True
                     self._write_stdout(joined)
                 cur.clear()
 
@@ -369,14 +380,16 @@ class TerminalHooks(Hooks):
                     flush_cur()
                     self._in_think = True
                     self._thinking_active = True
-                    self._write_stdout(ANSI_THINKING)
+                    self._write_stdout(THOUGHTS_PREFIX)
+                    self._thinking_written = True
                     i += 7
                     continue
                 elif lower.startswith("[thinking:"):
                     flush_cur()
                     self._in_bracket = True
                     self._thinking_active = True
-                    self._write_stdout(ANSI_THINKING)
+                    self._write_stdout(THOUGHTS_PREFIX)
+                    self._thinking_written = True
                     i += 10
                     continue
 
@@ -463,6 +476,7 @@ class TerminalHooks(Hooks):
 
         self._at_line_start = True
         self._in_roleplay_asterisk = False
+        self._ai_prefix_printed = False
 
         if not self._last_char_was_newline:
             self._write_stdout("\n")
