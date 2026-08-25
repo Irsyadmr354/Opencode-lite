@@ -22,6 +22,7 @@ api_key = "ollama"                      # placeholder; local servers ignore it
 max_tool_rounds = 12                    # default: 25
 stream = true                           # stream assistant tokens
 verbose = false                         # show Ollama performance stats after each turn
+timeout_s = 600                         # request timeout in seconds (potato: 600)
 # workspace = ""                        # empty -> directory you launch from
 # shell_cmd = ["powershell", "-NoProfile", "-Command"]  # Windows default
 
@@ -312,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: failed to load config {config_path}: {exc}", file=sys.stderr)
         return 2
 
-    client = LLMClient(config.base_url, config.api_key, config.model)
+    client = LLMClient(config.base_url, config.api_key, config.model, timeout_s=int(getattr(config, "timeout_s", 600)))
     tools = get_tools(config.workspace, config)
 
     if ns.print_mode is not None:

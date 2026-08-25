@@ -215,6 +215,11 @@ class LLMClient:
                             }
                         if choice.get("finish_reason"):
                             finish_reason = choice["finish_reason"]
+        except httpx.TimeoutException as exc:
+            raise LLMError(
+                f"request timed out after {self.timeout_s}s (potato laptop may need longer) — "
+                f"try increasing timeout_s in config or use a faster model"
+            ) from exc
         except httpx.HTTPError as exc:
             raise LLMError(f"request failed: {exc}") from exc
 

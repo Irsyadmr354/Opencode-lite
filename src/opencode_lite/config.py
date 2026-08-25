@@ -39,6 +39,7 @@ class Config:
     max_tool_rounds: int = 25
     stream: bool = True
     verbose: bool = False
+    timeout_s: int = 600
     limits: Limits = field(default_factory=Limits)
     permissions: Permissions = field(default_factory=Permissions)
     shell_cmd: list[str] = field(
@@ -56,6 +57,7 @@ _TOP_LEVEL_KEYS = {
     "max_tool_rounds",
     "stream",
     "verbose",
+    "timeout_s",
     "shell_cmd",
 }
 
@@ -106,6 +108,10 @@ def _apply(cfg: Config, top: dict, limits: dict, permissions: dict) -> None:
         v = top["verbose"]
         if not isinstance(v, bool):
             raise ValueError(f"invalid verbose value {v!r}: expected bool")
+    if "timeout_s" in top:
+        tv = top["timeout_s"]
+        if not isinstance(tv, int) or tv <= 0:
+            raise ValueError(f"invalid timeout_s value {tv!r}: expected positive int")
     for key, value in top.items():
         setattr(cfg, key, value)
     for key, value in limits.items():
@@ -134,6 +140,12 @@ def load_config(path: pathlib.Path | None = None, overrides: dict | None = None)
     env_verbose = os.environ.get("OCLITE_VERBOSE")
     if env_verbose is not None:
         cfg.verbose = env_verbose.strip().lower() in ("1", "true", "yes")
+    env_timeout = os.environ.get("OCLITE_TIMEOUT_S")
+    if env_timeout is not None:
+        try:
+            cfg.timeout_s = int(env_timeout)
+        except ValueError:
+            raise ValueError(f"invalid OCLITE_TIMEOUT_S value {env_timeout!r}: expected int")
 
     if overrides:
         top, limits, permissions = _split_mapping(overrides)
