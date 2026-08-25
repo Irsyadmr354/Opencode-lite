@@ -32,7 +32,7 @@ class Permissions:
 
 @dataclass
 class Config:
-    model: str = "qwen3-4b-abliterated-v2"
+    model: str = "qwen3.5-4b-uncensored"
     base_url: str = "http://127.0.0.1:11434/v1"
     api_key: str = "ollama"
     workspace: pathlib.Path = field(default_factory=pathlib.Path.cwd)
