@@ -32,8 +32,8 @@ class Permissions:
 
 @dataclass
 class Config:
-    model: str = "qwen2.5-coder:7b"
-    base_url: str = "http://localhost:11434/v1"
+    model: str = "qwen-coder-balanced"
+    base_url: str = "http://127.0.0.1:11434/v1"
     api_key: str = "ollama"
     workspace: pathlib.Path = field(default_factory=pathlib.Path.cwd)
     max_tool_rounds: int = 25
