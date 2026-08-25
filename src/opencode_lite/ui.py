@@ -172,11 +172,18 @@ class ChatApp(App[None]):
         outer = self
 
         class UiHooks(Hooks):
+            def __init__(self) -> None:
+                super().__init__()
+                self._current_delta_parts: list[str] = []
+
             def on_delta(self, text: str) -> None:
-                outer._ui(lambda: outer._chat().write(text))
+                self._current_delta_parts.append(text)
 
             def on_assistant_done(self, turn: Any) -> None:
-                outer._ui(lambda: outer._chat().write(Text("")))
+                full_text = "".join(self._current_delta_parts).strip()
+                self._current_delta_parts.clear()
+                if full_text:
+                    outer._ui(lambda: outer._chat().write(Text(full_text + "\n")))
 
             def on_tool_start(self, name: str, args: dict) -> None:
                 line = Text(f">> {name} {_compact_json(args)}", style="dim cyan")
