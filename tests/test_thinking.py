@@ -152,3 +152,47 @@ def test_ui_split_tag_no_leak():
     assert "<think>" not in output
     assert "</think>" not in output
 
+
+def test_ui_collapses_thinking_on_transition_to_content():
+    """Reasoning stream must emit ANSI line-clearing sequences when content starts."""
+    out = io.StringIO()
+    hooks = ui_mod.TerminalHooks(stdout=out)
+    hooks.on_reasoning("analyzing the code\nfinding bugs")
+    # At this point, thinking text is streamed
+    assert "analyzing the code" in out.getvalue()
+    # Transition to normal delta triggers collapse
+    hooks.on_delta("Here is the fix.")
+    hooks.on_assistant_done(SimpleNamespace(content="Here is the fix."))
+
+    output = out.getvalue()
+    # ANSI clear line code \033[2K and cursor movement \033[1A must be present
+    assert "\033[2K" in output
+    assert "\033[1A" in output
+    assert "Here is the fix." in output
+
+
+def test_ui_collapses_think_tags_on_close():
+    """<think> tags must emit ANSI line-clearing sequences when </think> closes."""
+    out = io.StringIO()
+    hooks = ui_mod.TerminalHooks(stdout=out)
+    hooks.on_delta("<think>pondering\nstep by step</think>Clean solution.")
+    hooks.on_assistant_done(SimpleNamespace(content="<think>pondering\nstep by step</think>Clean solution."))
+
+    output = out.getvalue()
+    assert "\033[2K" in output
+    assert "\033[1A" in output
+    assert "Clean solution." in output
+
+
+def test_ui_collapses_bracket_thinking_on_close():
+    """[thinking: ...] must emit ANSI line-clearing sequences when bracket closes."""
+    out = io.StringIO()
+    hooks = ui_mod.TerminalHooks(stdout=out)
+    hooks.on_delta("[thinking: quick thoughts]Ready.")
+    hooks.on_assistant_done(SimpleNamespace(content="[thinking: quick thoughts]Ready."))
+
+    output = out.getvalue()
+    assert "\033[2K" in output
+    assert "Ready." in output
+
+

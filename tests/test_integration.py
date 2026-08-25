@@ -406,3 +406,71 @@ def test_repl_eof_clean_exit(tmp_path):
     combined = "\n".join(outputs)
     assert "Goodbye!" in combined
 
+
+def test_prompt_prefix_styled_bold_cyan(tmp_path):
+    agent = FakeAgent()
+    cfg = SimpleNamespace(model="fake", workspace=tmp_path)
+    prompts_received = []
+
+    def sim_input(prompt: str) -> str:
+        prompts_received.append(prompt)
+        return "/exit"
+
+    ui_mod.run_repl(
+        agent=agent,
+        config=cfg,
+        input_fn=sim_input,
+        output_fn=lambda msg: None,
+        clear_fn=lambda: None,
+    )
+
+    assert len(prompts_received) == 1
+    assert prompts_received[0] == "\033[1;36m>\033[0m "
+    assert ui_mod.PROMPT_PREFIX == "\033[1;36m>\033[0m "
+
+
+def test_strip_roleplay_asterisks_streaming_and_helper():
+    # Helper test
+    raw = "*Assistant is online and ready to help.*"
+    cleaned = ui_mod.clean_roleplay_asterisks(raw)
+    assert cleaned == "Assistant is online and ready to help."
+
+    action_raw = "*Nods.* I can help you with this."
+    cleaned_action = ui_mod.clean_roleplay_asterisks(action_raw)
+    assert cleaned_action == "Nods. I can help you with this."
+
+    # Streaming test in TerminalHooks
+    out = io.StringIO()
+    hooks = ui_mod.TerminalHooks(stdout=out)
+    hooks.on_delta("*")
+    hooks.on_delta("Assistant is online")
+    hooks.on_delta(" and ready to help.*")
+    hooks.on_assistant_done(SimpleNamespace(content="*Assistant is online and ready to help.*"))
+
+    output = out.getvalue()
+    assert "Assistant is online and ready to help." in output
+    assert "*Assistant" not in output
+    assert "help.*" not in output
+
+
+def test_strip_roleplay_asterisks_preserves_bold_and_bullets():
+    bold_text = "**Important:** Do not delete files."
+    assert ui_mod.clean_roleplay_asterisks(bold_text) == bold_text
+
+    bullet_list = "* item 1\n* item 2\n* item 3"
+    assert ui_mod.clean_roleplay_asterisks(bullet_list) == bullet_list
+
+    # Streaming preservation of bold and bullet in TerminalHooks
+    out_bold = io.StringIO()
+    hooks_bold = ui_mod.TerminalHooks(stdout=out_bold)
+    hooks_bold.on_delta("**Important:** Do not delete files.")
+    hooks_bold.on_assistant_done(SimpleNamespace(content="**Important:** Do not delete files."))
+    assert "**Important:** Do not delete files." in out_bold.getvalue()
+
+    out_bullet = io.StringIO()
+    hooks_bullet = ui_mod.TerminalHooks(stdout=out_bullet)
+    hooks_bullet.on_delta("* First bullet\n* Second bullet")
+    hooks_bullet.on_assistant_done(SimpleNamespace(content="* First bullet\n* Second bullet"))
+    assert "* First bullet\n* Second bullet" in out_bullet.getvalue()
+
+

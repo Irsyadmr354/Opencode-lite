@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -52,8 +53,13 @@ ANSI_DIM_GREEN = "\033[2;32m"
 ANSI_YELLOW = "\033[33m"
 ANSI_BOLD_YELLOW = "\033[1;33m"
 ANSI_CYAN = "\033[36m"
+ANSI_BOLD_CYAN = "\033[1;36m"
 ANSI_DIM_CYAN = "\033[2;36m"
+ANSI_WHITE = "\033[37m"
+ANSI_BOLD_WHITE = "\033[1;37m"
 ANSI_THINKING = "\033[3;2;36m"  # italic dim cyan
+
+PROMPT_PREFIX = f"{ANSI_BOLD_CYAN}>{ANSI_RESET} "
 
 
 def _compact_json(args: Any) -> str:
@@ -97,7 +103,59 @@ def _pretty_json(args: Any, max_lines: int = ARGS_PREVIEW_LINES) -> str:
     return "\n".join(lines)
 
 
-def _tag_holdback(buffer: str, in_think: bool) -> int:
+def clean_roleplay_asterisks(text: str) -> str:
+    """Clean roleplay asterisks from text (e.g. *Assistant is ready* -> Assistant is ready).
+    Preserves markdown bold (**text**) and bullet lists (* item)."""
+    if not text:
+        return text
+    lines = text.splitlines(keepends=True)
+    cleaned_lines = []
+    for line in lines:
+        newline = ""
+        if line.endswith("\r\n"):
+            newline = "\r\n"
+            content = line[:-2]
+        elif line.endswith("\n"):
+            newline = "\n"
+            content = line[:-1]
+        else:
+            content = line
+
+        stripped = content.strip()
+        # Skip empty lines, markdown bold (**...), and standard bullet lists (* item)
+        if not stripped or stripped.startswith("**"):
+            cleaned_lines.append(line)
+            continue
+
+        if stripped.startswith("* ") and not (stripped.endswith("*") and not stripped.endswith("**")):
+            cleaned_lines.append(line)
+            continue
+
+        # Check for full line wrapped in single *...*
+        if stripped.startswith("*") and not stripped.startswith("**") and stripped.endswith("*") and not stripped.endswith("**") and len(stripped) > 1:
+            indent = content[:len(content) - len(content.lstrip())]
+            inner = stripped[1:-1].strip()
+            cleaned_lines.append(f"{indent}{inner}{newline}")
+            continue
+
+        # Check for leading roleplay action: *Action* Rest of sentence
+        m = re.match(r"^\*([^*\r\n]+)\*\s*(.*)$", stripped)
+        if m and not stripped.startswith("**"):
+            indent = content[:len(content) - len(content.lstrip())]
+            action = m.group(1).strip()
+            rest = m.group(2).strip()
+            if rest:
+                cleaned_lines.append(f"{indent}{action} {rest}{newline}")
+            else:
+                cleaned_lines.append(f"{indent}{action}{newline}")
+            continue
+
+        cleaned_lines.append(line)
+
+    return "".join(cleaned_lines)
+
+
+def _tag_holdback(buffer: str, in_think: bool, at_line_start: bool = False) -> int:
     """Length of buffer's trailing fragment that might be a PARTIAL tag token.
 
     Prevents flushing text that ends in e.g. ``"<thi"`` — if that fragment
@@ -111,6 +169,8 @@ def _tag_holdback(buffer: str, in_think: bool) -> int:
         tail = buffer[-h:].lower()
         if any(c.startswith(tail) and c != tail for c in candidates):
             return h
+    if not in_think and at_line_start and buffer == "*":
+        return 1
     return 0
 
 
@@ -175,7 +235,8 @@ def _parse_thinking_text(text: str, state: dict[str, bool]) -> Text:
 
 class TerminalHooks(Hooks):
     """Pure native terminal hooks for real-time word-by-word streaming, ANSI colors,
-    clean inline tool execution, inline permission prompts, and red error messages."""
+    clean inline tool execution, inline permission prompts, thinking collapse/clear,
+    and red error messages."""
 
     def __init__(
         self,
@@ -191,8 +252,13 @@ class TerminalHooks(Hooks):
         self._in_bracket: bool = False
         self._buffer: str = ""
         self._saw_reasoning: bool = False
+        self._thinking_active: bool = False
+        self._thinking_written: bool = False
+        self._thinking_lines: int = 0
         self._current_tool: tuple[str, str] | None = None
         self._last_char_was_newline: bool = True
+        self._at_line_start: bool = True
+        self._in_roleplay_asterisk: bool = False
         self.had_error: bool = False
 
     def _write_stdout(self, text: str) -> None:
@@ -208,15 +274,41 @@ class TerminalHooks(Hooks):
         self._stderr.write(text)
         self._stderr.flush()
 
+    def _collapse_thinking(self) -> None:
+        """Collapse and erase streamed thinking from the terminal screen."""
+        if not self._thinking_active and not self._saw_reasoning:
+            return
+        if self._thinking_written:
+            # Clear current line
+            erase_seq = "\r\033[2K"
+            # For each previous line written during thinking, move up and clear
+            if self._thinking_lines > 0:
+                erase_seq += "\033[1A\033[2K" * self._thinking_lines
+            erase_seq += "\r"
+            self._write_stdout(f"{ANSI_RESET}{erase_seq}")
+        else:
+            self._write_stdout(ANSI_RESET)
+
+        self._thinking_active = False
+        self._saw_reasoning = False
+        self._thinking_written = False
+        self._thinking_lines = 0
+        self._last_char_was_newline = True
+        self._at_line_start = True
+
     def reset_stream(self) -> None:
         """Reset internal streaming state cleanly."""
-        if self._in_think or self._in_bracket or self._saw_reasoning:
-            self._write_stdout(ANSI_RESET)
+        self._collapse_thinking()
         self._in_think = False
         self._in_bracket = False
         self._buffer = ""
         self._saw_reasoning = False
+        self._thinking_active = False
+        self._thinking_written = False
+        self._thinking_lines = 0
         self._current_tool = None
+        self._at_line_start = True
+        self._in_roleplay_asterisk = False
 
     def on_reasoning(self, text: str) -> None:
         """Real-time streaming for dedicated reasoning/reasoning_content field in italic dim cyan."""
@@ -224,21 +316,21 @@ class TerminalHooks(Hooks):
             return
         if not self._saw_reasoning:
             self._saw_reasoning = True
+            self._thinking_active = True
             self._write_stdout(ANSI_THINKING)
         self._write_stdout(text)
+        self._thinking_written = True
+        self._thinking_lines += text.count("\n")
 
     def on_delta(self, text: str) -> None:
-        """Real-time word-by-word streaming directly to stdout, parsing <think>...</think> in italic dim cyan."""
+        """Real-time word-by-word streaming directly to stdout, collapsing thinking on transition."""
         if not text:
             return
-        if self._saw_reasoning:
-            self._write_stdout(ANSI_RESET)
-            if not self._last_char_was_newline:
-                self._write_stdout("\n")
-            self._saw_reasoning = False
+        if self._saw_reasoning or (self._thinking_active and not self._in_think and not self._in_bracket):
+            self._collapse_thinking()
 
         self._buffer += text
-        hold = _tag_holdback(self._buffer, self._in_think)
+        hold = _tag_holdback(self._buffer, self._in_think, self._at_line_start)
         if hold > 0:
             to_process = self._buffer[:-hold]
             self._buffer = self._buffer[-hold:]
@@ -261,44 +353,94 @@ class TerminalHooks(Hooks):
                 joined = "".join(cur)
                 if style:
                     self._write_stdout(f"{style}{joined}{ANSI_RESET}")
+                    if self._thinking_active:
+                        self._thinking_written = True
+                        self._thinking_lines += joined.count("\n")
                 else:
                     self._write_stdout(joined)
                 cur.clear()
 
         while i < n:
+            ch = chunk[i]
+
             if not self._in_think and not self._in_bracket:
                 lower = chunk[i:].lower()
                 if lower.startswith("<think>"):
                     flush_cur()
                     self._in_think = True
+                    self._thinking_active = True
                     self._write_stdout(ANSI_THINKING)
                     i += 7
+                    continue
                 elif lower.startswith("[thinking:"):
                     flush_cur()
                     self._in_bracket = True
+                    self._thinking_active = True
                     self._write_stdout(ANSI_THINKING)
                     i += 10
-                else:
-                    cur.append(chunk[i])
+                    continue
+
+                # Strip roleplay asterisks at line start
+                if self._at_line_start and ch == "*":
+                    if i + 1 < n:
+                        next_ch = chunk[i + 1]
+                        if next_ch == "*":
+                            # Markdown bold "**"
+                            self._at_line_start = False
+                            cur.append("**")
+                            i += 2
+                            continue
+                        elif next_ch == " ":
+                            # Markdown bullet "* "
+                            self._at_line_start = False
+                            cur.append("* ")
+                            i += 2
+                            continue
+                        elif next_ch not in ("\n", "\r"):
+                            # Roleplay asterisk start -> skip leading asterisk
+                            self._at_line_start = False
+                            self._in_roleplay_asterisk = True
+                            i += 1
+                            continue
+                    else:
+                        self._at_line_start = False
+                        cur.append(ch)
+                        i += 1
+                        continue
+
+                # Strip matching roleplay closing asterisk
+                if self._in_roleplay_asterisk and ch == "*":
+                    self._in_roleplay_asterisk = False
                     i += 1
+                    continue
+
+                if ch == "\n":
+                    self._at_line_start = True
+                    self._in_roleplay_asterisk = False
+                elif ch != " " and ch != "\r":
+                    self._at_line_start = False
+
+                cur.append(ch)
+                i += 1
+
             elif self._in_think:
                 lower = chunk[i:].lower()
                 if lower.startswith("</think>"):
                     flush_cur(ANSI_THINKING)
                     self._in_think = False
-                    self._write_stdout(ANSI_RESET)
+                    self._collapse_thinking()
                     i += 8
                 else:
-                    cur.append(chunk[i])
+                    cur.append(ch)
                     i += 1
             elif self._in_bracket:
-                if chunk[i] == "]":
+                if ch == "]":
                     flush_cur(ANSI_THINKING)
                     self._in_bracket = False
-                    self._write_stdout(ANSI_RESET)
+                    self._collapse_thinking()
                     i += 1
                 else:
-                    cur.append(chunk[i])
+                    cur.append(ch)
                     i += 1
 
         if cur:
@@ -308,17 +450,19 @@ class TerminalHooks(Hooks):
                 flush_cur()
 
     def on_assistant_done(self, turn: Any) -> None:
-        """Called when the assistant turn completes. Flush buffers, reset styles, ensure newline."""
+        """Called when the assistant turn completes. Flush buffers, collapse active thinking, ensure newline."""
         if self._buffer:
             buf = self._buffer
             self._buffer = ""
             self._render_chunk(buf)
 
-        if self._in_think or self._in_bracket or self._saw_reasoning:
-            self._write_stdout(ANSI_RESET)
+        if self._in_think or self._in_bracket or self._saw_reasoning or self._thinking_active:
+            self._collapse_thinking()
             self._in_think = False
             self._in_bracket = False
-            self._saw_reasoning = False
+
+        self._at_line_start = True
+        self._in_roleplay_asterisk = False
 
         if not self._last_char_was_newline:
             self._write_stdout("\n")
@@ -451,9 +595,9 @@ def run_repl(
     model = getattr(config, "model", getattr(getattr(agent, "client", None), "model", "default"))
     workspace = getattr(config, "workspace", Path.cwd())
 
-    # Minimal banner
-    _print(f"opencode-lite {VERSION} | model: {model} | workspace: {workspace}")
-    _print("Type /help for commands, /exit to quit.\n")
+    # Minimal banner in dim styling
+    _print(f"{ANSI_DIM}opencode-lite {VERSION} | model: {model} | workspace: {workspace}{ANSI_RESET}")
+    _print(f"{ANSI_DIM}Type /help for commands, /exit to quit.{ANSI_RESET}\n")
 
     hooks = TerminalHooks(input_fn=_read_input)
     if hasattr(agent, "hooks"):
@@ -463,17 +607,17 @@ def run_repl(
 
     while True:
         try:
-            user_input = _read_input("> ").strip()
+            user_input = _read_input(PROMPT_PREFIX).strip()
             last_was_sigint = False
         except KeyboardInterrupt:
             if last_was_sigint:
-                _print("\nGoodbye!")
+                _print(f"\n{ANSI_DIM}Goodbye!{ANSI_RESET}")
                 break
             last_was_sigint = True
-            _print("\nType /exit or press Ctrl+C again to quit.")
+            _print(f"\n{ANSI_DIM}Type /exit or press Ctrl+C again to quit.{ANSI_RESET}")
             continue
         except EOFError:
-            _print("\nGoodbye!")
+            _print(f"\n{ANSI_DIM}Goodbye!{ANSI_RESET}")
             break
 
         if not user_input:
@@ -485,7 +629,7 @@ def run_repl(
             arg = parts[1].strip() if len(parts) > 1 else ""
 
             if cmd in ("/exit", "/quit", "/q"):
-                _print("Goodbye!")
+                _print(f"{ANSI_DIM}Goodbye!{ANSI_RESET}")
                 break
             elif cmd in ("/help", "/?", "/h"):
                 _print(_get_help_text())
@@ -498,7 +642,7 @@ def run_repl(
                     agent.reset()
                 elif hasattr(agent, "messages"):
                     agent.messages.clear()
-                _print("Session memory reset.\n")
+                _print(f"{ANSI_DIM}Session memory reset.{ANSI_RESET}\n")
                 continue
             elif cmd == "/model":
                 if arg:
@@ -506,10 +650,10 @@ def run_repl(
                         config.model = arg
                     if hasattr(agent, "client") and hasattr(agent.client, "model"):
                         agent.client.model = arg
-                    _print(f"Model switched to: {arg}\n")
+                    _print(f"{ANSI_DIM}Model switched to: {arg}{ANSI_RESET}\n")
                 else:
                     cur_model = getattr(config, "model", getattr(getattr(agent, "client", None), "model", "?"))
-                    _print(f"Active model: {cur_model}\n")
+                    _print(f"{ANSI_DIM}Active model: {cur_model}{ANSI_RESET}\n")
                 continue
             elif cmd == "/status":
                 ws = getattr(config, "workspace", getattr(agent, "config", None) and getattr(agent.config, "workspace", "."))
@@ -530,7 +674,7 @@ def run_repl(
                 _print()
                 continue
             else:
-                _print(f"Unknown command '{cmd}'. Type /help for available commands.\n")
+                _print(f"{ANSI_RED}Unknown command '{cmd}'. Type /help for available commands.{ANSI_RESET}\n")
                 continue
 
         # Normal prompt submission to agent
@@ -539,7 +683,7 @@ def run_repl(
         except KeyboardInterrupt:
             agent.cancelled = True
             hooks.reset_stream()
-            _print("\n[Cancelled]\n")
+            _print(f"\n{ANSI_DIM}[Cancelled]{ANSI_RESET}\n")
             if hasattr(agent, "messages") and agent.messages and agent.messages[-1].get("role") == "user":
                 agent.messages.pop()
         except Exception as exc:
