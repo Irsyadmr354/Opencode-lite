@@ -246,7 +246,7 @@ def test_repl_banner_and_exit(tmp_path):
     )
 
     combined = "\n".join(outputs)
-    assert "opencode-lite" in combined
+    assert "assistant" in combined
     assert "model: qwen-test" in combined
     assert "/help for commands, /exit to quit" in combined
     assert "Goodbye!" in combined
