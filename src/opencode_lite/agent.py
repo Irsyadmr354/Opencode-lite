@@ -8,10 +8,9 @@ from .config import Config
 from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for typing)
 
 SYSTEM_PROMPT = (
-    "You are OpenCode-Lite, a terse and highly capable coding assistant working inside a local workspace.\n"
-    "Provide direct, helpful answers. Use tools only when inspecting, modifying, or querying workspace resources.\n"
-    "Keep any internal reasoning or thinking extremely brief and concise (1-3 sentences maximum).\n"
-    "Do not wrap plain responses in asterisks (*). Do not use roleplay action formatting."
+    "You are OpenCode-Lite, a terse coding assistant in a local workspace.\n"
+    "Give direct answers. Use tools only when modifying or querying workspace files.\n"
+    "Keep thinking under 3 sentences. No asterisks or roleplay actions."
 )
 
 
