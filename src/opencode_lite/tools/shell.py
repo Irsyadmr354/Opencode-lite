@@ -11,6 +11,11 @@ import subprocess
 
 from opencode_lite.tools import Tool, ToolResult
 
+# Model-supplied timeouts are clamped into [1, config.limits.shell_timeout_s]:
+# a model may lower the timeout but never raise it. On Windows, subprocess.run
+# with a negative timeout waits ~forever, hence the hard floor of 1 second.
+_MIN_TIMEOUT_S = 1
+
 
 def shell_tool(workspace: pathlib.Path, config) -> Tool:
     default_timeout = int(config.limits.shell_timeout_s)
@@ -23,9 +28,11 @@ def shell_tool(workspace: pathlib.Path, config) -> Tool:
                 return ToolResult(False, "ERROR: missing argument 'command'")
             raw_timeout = args.get("timeout_s")
             try:
-                timeout = int(raw_timeout) if raw_timeout else default_timeout
+                requested = int(raw_timeout) if raw_timeout else default_timeout
             except (TypeError, ValueError):
                 return ToolResult(False, "ERROR: timeout_s must be an integer")
+            limit = max(default_timeout, _MIN_TIMEOUT_S)
+            timeout = min(max(requested, _MIN_TIMEOUT_S), limit)
 
             try:
                 proc = subprocess.run(

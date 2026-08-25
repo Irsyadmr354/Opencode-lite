@@ -1,7 +1,7 @@
 """Configuration dataclasses and TOML/env/overrides loading for opencode-lite.
 
-Config is pure data: permission strings (allow|ask|deny) are enforced by the
-UI layer, never here.
+Config is pure data: [permissions] values are normalized and validated here
+(allow|ask|deny), but enforcement of those decisions lives in the UI layer.
 """
 
 from __future__ import annotations
@@ -58,6 +58,24 @@ _TOP_LEVEL_KEYS = {
 }
 
 
+_VALID_PERMISSION_VALUES = frozenset({"allow", "ask", "deny"})
+
+
+def _normalized_permission(key: str, value: object) -> str:
+    """Normalize a [permissions] value; reject anything outside allow|ask|deny.
+
+    A typo like ``shell = "Ask"`` must fail loudly instead of silently
+    disabling the safety prompt (consumers treat unknown values as allow).
+    """
+    normalized = str(value).strip().lower()
+    if normalized not in _VALID_PERMISSION_VALUES:
+        raise ValueError(
+            f"invalid permissions.{key} value {value!r}: "
+            'expected "allow" | "ask" | "deny"'
+        )
+    return normalized
+
+
 def _check_section(section: dict, cls: type, label: str) -> None:
     known = {f.name for f in fields(cls)}
     unknown = sorted(set(section) - known)
@@ -87,7 +105,7 @@ def _apply(cfg: Config, top: dict, limits: dict, permissions: dict) -> None:
     for key, value in limits.items():
         setattr(cfg.limits, key, value)
     for key, value in permissions.items():
-        setattr(cfg.permissions, key, value)
+        setattr(cfg.permissions, key, _normalized_permission(key, value))
     if workspace is not None:
         cfg.workspace = pathlib.Path(str(workspace)).expanduser().resolve()
 

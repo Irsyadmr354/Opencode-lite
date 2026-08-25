@@ -19,7 +19,7 @@ SAMPLE_CONFIG = '''\
 model = "qwen2.5-coder:7b"              # any model available in Ollama
 base_url = "http://127.0.0.1:11434/v1"  # Ollama OpenAI-compatible endpoint
 api_key = "ollama"                      # placeholder; local servers ignore it
-max_tool_rounds = 12                    # tool-call rounds per user request
+max_tool_rounds = 12                    # default: 25
 stream = true                           # stream assistant tokens
 # workspace = ""                        # empty -> directory you launch from
 # shell_cmd = ["powershell", "-NoProfile", "-Command"]  # Windows default
@@ -91,6 +91,10 @@ def build_console_hooks(hooks_base: type) -> type:
             )
 
         def on_permission(self, name: str, args: dict) -> bool:
+            if not sys.stdin.isatty():
+                # Piped/non-interactive stdin (-p mode): never auto-authorize,
+                # and keep stdout pure by not emitting the prompt at all.
+                return False
             try:
                 answer = input(f"Allow {name}? [y/N] ").strip().lower()
             except (EOFError, KeyboardInterrupt):

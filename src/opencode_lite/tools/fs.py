@@ -6,13 +6,20 @@ All tool bodies are wrapped in try/except — a Tool.fn never raises.
 """
 from __future__ import annotations
 
+import heapq
 import os
 import pathlib
-from typing import Callable, Iterable
+import re
+from typing import Callable, Generator, Iterable
 
 from opencode_lite.tools import Tool, ToolResult
 
 _EXCLUDED_PARTS = {".git", "__pycache__", "node_modules", ".venv", ".pytest_cache"}
+
+# Refuse to buffer files larger than this into memory (read_file).
+_MAX_READ_BYTES = 10 * 1024 * 1024
+# Upper bound on entries enumerated per list_files traversal (early stop).
+_MAX_WALK_ENTRIES = 100_000
 
 _MISSING = "ERROR: missing argument '{}'"
 _OUTSIDE = "ERROR: path outside workspace"
@@ -36,6 +43,61 @@ def _is_excluded(parts: Iterable[str]) -> bool:
     return False
 
 
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a glob pattern to a regex over '/'-separated relative paths.
+
+    ``*``/``?`` never cross directory separators; ``**`` does (``**/`` also
+    matches zero directories), mirroring pathlib glob semantics closely enough
+    for the patterns this tool accepts.
+    """
+    out: list[str] = []
+    i, n = 0, len(pattern)
+    while i < n:
+        char = pattern[i]
+        if char == "*":
+            j = i
+            while j < n and pattern[j] == "*":
+                j += 1
+            if j - i >= 2:
+                if j < n and pattern[j] == "/":
+                    out.append(r"(?:[^/]+/)*")
+                    j += 1
+                else:
+                    out.append(r".*")
+            else:
+                out.append(r"[^/]*")
+            i = j
+        elif char == "?":
+            out.append(r"[^/]")
+            i += 1
+        else:
+            out.append(re.escape(char))
+            i += 1
+    return re.compile("".join(out), re.DOTALL)
+
+
+def _iter_entries(base: pathlib.Path, cap: int) -> Generator[pathlib.Path]:
+    """Yield files and dirs under *base*, pruning excluded dirs before descent.
+
+    Unlike ``Path.glob("**/*")`` this never materializes the full tree and
+    stops after *cap* raw entries, so huge junk trees cannot exhaust memory.
+    """
+    scanned = 0
+    for root, dirs, names in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if not _is_excluded((d,)))
+        root_path = pathlib.Path(root)
+        for name in sorted(names):
+            if scanned >= cap:
+                return
+            scanned += 1
+            yield root_path / name
+        for name in dirs:
+            if scanned >= cap:
+                return
+            scanned += 1
+            yield root_path / name
+
+
 # --- read_file ---------------------------------------------------------------
 def read_file_tool(workspace: pathlib.Path, config) -> Tool:
     max_lines = int(config.limits.read_max_lines)
@@ -50,6 +112,13 @@ def read_file_tool(workspace: pathlib.Path, config) -> Tool:
                 return ToolResult(False, _OUTSIDE)
             if not target.is_file():
                 return ToolResult(False, f"ERROR: not a file: {raw}")
+            size = target.stat().st_size
+            if size > _MAX_READ_BYTES:
+                return ToolResult(
+                    False,
+                    f"ERROR: file too large: {size} bytes "
+                    f"(limit {_MAX_READ_BYTES} bytes)",
+                )
             try:
                 start_line = int(args.get("start_line") or 1)
             except (TypeError, ValueError):
@@ -189,29 +258,46 @@ def list_files_tool(workspace: pathlib.Path, config) -> Tool:
     def fn(args: dict) -> ToolResult:
         try:
             raw = args.get("path") or "."
-            pattern = args.get("pattern") or "**/*"
+            pattern = str(args.get("pattern") or "**/*")
             ws, base = _resolve_in_workspace(workspace, raw)
             if base is None:
                 return ToolResult(False, _OUTSIDE)
             if not base.is_dir():
                 return ToolResult(False, f"ERROR: not a directory: {raw}")
 
-            matches = [p for p in sorted(base.glob(str(pattern)))
-                       if not _is_excluded(p.relative_to(base).parts)]
-            matches.sort(
+            regex = _glob_to_regex(pattern)
+
+            total_matched = 0
+
+            def _counting(iterable: Iterable[pathlib.Path]) -> Generator[pathlib.Path]:
+                nonlocal total_matched
+                for item in iterable:
+                    total_matched += 1
+                    yield item
+
+            candidates = (
+                p
+                for p in _iter_entries(base, _MAX_WALK_ENTRIES)
+                if not _is_excluded(p.relative_to(base).parts)
+                and regex.fullmatch(p.relative_to(base).as_posix())
+            )
+            # Streaming top-k: identical result to sorted(all)[:max_entries]
+            # while holding only max_entries paths in memory.
+            matches = heapq.nsmallest(
+                max_entries,
+                _counting(candidates),
                 key=lambda p: (
                     0 if p.is_dir() else 1,
                     p.relative_to(ws).as_posix().lower(),
-                )
+                ),
             )
 
-            shown = matches[:max_entries]
             lines = [
                 p.relative_to(ws).as_posix() + ("/" if p.is_dir() else "")
-                for p in shown
+                for p in matches
             ]
             output = "\n".join(lines)
-            hidden = len(matches) - len(shown)
+            hidden = total_matched - len(matches)
             if hidden > 0:
                 output += f"\n... and {hidden} more"
             if not output:

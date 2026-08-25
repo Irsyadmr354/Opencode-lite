@@ -1,7 +1,7 @@
 # opencode-lite
 
-Minimal, opencode-like TUI coding agent for **local models**. It runs a
-Textual chat interface (or a headless one-shot mode) against an Ollama
+Minimal, opencode-like coding agent for **local models**. It runs a
+native-terminal chat REPL (or a headless one-shot mode) against an Ollama
 endpoint and lets the model work inside a workspace directory using 7 tools:
 read files, list files, write files, delete files, run shell commands,
 fetch web pages, and search the web. Local-model-first: everything runs on
@@ -25,13 +25,14 @@ pip install -e .
 ## Run
 
 ```powershell
-opencode-lite                      # TUI (or: python -m opencode_lite)
+opencode-lite                      # interactive REPL (or: python -m opencode_lite)
 opencode-lite --model qwen3:8b     # override model
 opencode-lite -p "list python files"   # headless: answer, print, exit
 ```
 
 Headless mode streams the answer to stdout, logs tool calls/results, asks
-`[y/N]` for permission-gated tools, and exits 0 on success / 1 on error.
+`[y/N]` for permission-gated tools (auto-denied when stdin is not an
+interactive terminal), and exits 0 on success / 1 on error.
 
 ## Tools
 
@@ -58,7 +59,7 @@ Edit it to set defaults:
 model = "qwen2.5-coder:7b"
 base_url = "http://127.0.0.1:11434/v1"
 api_key = "ollama"
-max_tool_rounds = 12
+max_tool_rounds = 12     # default: 25
 stream = true
 
 [permissions]
@@ -80,15 +81,16 @@ websearch = "allow"
 CLI flags (`--model`, `--base-url`, `--workspace`, `--config`) override the
 config file.
 
-## Keybindings
+## REPL commands & keybindings
+
+Slash commands: `/help`, `/clear`, `/cls`, `/model [name]`, `/status`,
+`/exit` (also `/quit`).
 
 | Key | Action |
 |---|---|
-| `enter` | Send message |
-| `ctrl+c` | Cancel generation; quit if idle |
-| `escape` | Cancel generation |
-| `ctrl+l` | Clear log view only |
-| `ctrl+q` | Quit |
+| `enter` | Send prompt |
+| `ctrl+c` | Cancel generation / reset prompt; press twice to quit |
+| `ctrl+d` / `ctrl+z` | Exit (EOF) |
 
 ## Limitations
 

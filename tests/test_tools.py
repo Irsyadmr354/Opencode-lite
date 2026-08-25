@@ -8,6 +8,7 @@ from __future__ import annotations
 import pathlib
 import re
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,8 @@ from opencode_lite.tools import (  # noqa: E402
     get_tools,
     openai_schema,
 )
+from opencode_lite.tools import fs as fs_mod  # noqa: E402
+from opencode_lite.tools import shell as shell_mod  # noqa: E402
 from opencode_lite.tools import web as web_mod  # noqa: E402
 
 
@@ -198,25 +201,65 @@ def test_shell_timeout(tmp_path):
 
 
 # --- 5. webfetch (offline via monkeypatch) ------------------------------------
-class FakeResponse:
-    def __init__(self, status_code, headers, text):
+class FakeStreamResponse:
+    """Stand-in for the httpx streaming response context object."""
+
+    def __init__(self, status_code, headers, text=""):
         self.status_code = status_code
         self.headers = headers
-        self.text = text
+        self._text = text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_text(self):
+        yield self._text
+
+
+def install_webfetch(monkeypatch, responses):
+    """Patch httpx.stream (url -> FakeStreamResponse) and DNS to a public IP.
+
+    Returns the list of URLs actually requested, so tests can assert that
+    blocked hops were never fetched.
+    """
+    calls = []
+
+    def fake_stream(method, url, **kwargs):
+        calls.append(url)
+        assert kwargs.get("follow_redirects") is False, "every hop must be gated"
+        assert "verify" not in kwargs, "TLS verification must stay untouched"
+        resp = responses.get(url)
+        assert resp is not None, f"unexpected fetch: {url}"
+        return resp
+
+    monkeypatch.setattr(web_mod.httpx, "stream", fake_stream)
+    monkeypatch.setattr(
+        web_mod.socket,
+        "getaddrinfo",
+        lambda host, *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))],
+    )
+    return calls
 
 
 def test_webfetch_html_and_error(tmp_path, monkeypatch):
     tm = tool_map(tmp_path)
     wf = tm["webfetch"]
 
-    monkeypatch.setattr(
-        web_mod.httpx,
-        "get",
-        lambda *a, **k: FakeResponse(
-            200,
-            {"content-type": "text/html"},
-            "<html><head><style>body { color: red; }</style></head><body><h1>Hi</h1><script>alert(1);</script><noscript>no js</noscript><svg><circle cx='5'/></svg><p>x</p></body></html>",
-        ),
+    install_webfetch(
+        monkeypatch,
+        {
+            "https://example.com/page": FakeStreamResponse(
+                200,
+                {"content-type": "text/html"},
+                "<html><head><style>body { color: red; }</style></head><body><h1>Hi</h1><script>alert(1);</script><noscript>no js</noscript><svg><circle cx='5'/></svg><p>x</p></body></html>",
+            ),
+            "https://example.com/missing": FakeStreamResponse(
+                404, {"content-type": "text/plain"}
+            ),
+        },
     )
     r = wf.fn({"url": "https://example.com/page"})
     assert r.ok
@@ -226,11 +269,6 @@ def test_webfetch_html_and_error(tmp_path, monkeypatch):
     assert "no js" not in r.output
     assert "circle cx" not in r.output
 
-    monkeypatch.setattr(
-        web_mod.httpx,
-        "get",
-        lambda *a, **k: FakeResponse(404, {"content-type": "text/plain"}, "gone"),
-    )
     r404 = wf.fn({"url": "https://example.com/missing"})
     assert not r404.ok and "404" in r404.output
 
@@ -239,6 +277,148 @@ def test_webfetch_scheme_guard_and_truncation(tmp_path):
     tm = tool_map(tmp_path, Config(webfetch_chars=5))
     guard = tm["webfetch"].fn({"url": "ftp://example.com/file"})
     assert not guard.ok and "http" in guard.output.lower()
+
+
+# --- 5b. webfetch SSRF hardening ----------------------------------------------
+def test_webfetch_blocks_private_literal_and_localhost(tmp_path):
+    tm = tool_map(tmp_path)
+    for url in (
+        "http://127.0.0.1:11434/v1/tags",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://192.168.1.10/admin",
+        "http://localhost:8080/",
+    ):
+        r = tm["webfetch"].fn({"url": url})
+        assert not r.ok, url
+        assert "blocked" in r.output, url
+
+
+def test_webfetch_blocks_redirect_to_private(tmp_path, monkeypatch):
+    tm = tool_map(tmp_path)
+    calls = install_webfetch(
+        monkeypatch,
+        {
+            "https://public.example/start": FakeStreamResponse(
+                302,
+                {"location": "http://127.0.0.1:9200/_cluster/health"},
+            ),
+        },
+    )
+    r = tm["webfetch"].fn({"url": "https://public.example/start"})
+    assert not r.ok
+    assert "blocked" in r.output
+    assert calls == ["https://public.example/start"]  # private hop never fetched
+
+
+def test_webfetch_blocks_private_dns_resolution(tmp_path, monkeypatch):
+    tm = tool_map(tmp_path)
+
+    def no_network(*a, **k):
+        raise AssertionError("network must not be reached for blocked hosts")
+
+    monkeypatch.setattr(web_mod.httpx, "stream", no_network)
+    monkeypatch.setattr(
+        web_mod.socket,
+        "getaddrinfo",
+        lambda host, *a, **k: [(2, 1, 6, "", ("10.0.0.5", 0))],
+    )
+    r = tm["webfetch"].fn({"url": "https://internal.example/secret"})
+    assert not r.ok and "blocked" in r.output
+
+
+def test_webfetch_follows_validated_redirects_and_truncates(tmp_path, monkeypatch):
+    tm = tool_map(tmp_path, Config(webfetch_chars=5))
+    install_webfetch(
+        monkeypatch,
+        {
+            "https://a.example/1": FakeStreamResponse(302, {"location": "/2"}),
+            "https://a.example/2": FakeStreamResponse(
+                200, {"content-type": "text/html"}, "<p>abcdef</p>"
+            ),
+        },
+    )
+    r = tm["webfetch"].fn({"url": "https://a.example/1"})
+    assert r.ok
+    assert r.output.startswith("abcde")
+    assert "...[truncated]" in r.output
+
+
+# --- 5c. shell timeout clamping -------------------------------------------------
+def test_shell_timeout_clamped_never_raised(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        return SimpleNamespace(stdout="ok", stderr="", returncode=0)
+
+    monkeypatch.setattr(shell_mod.subprocess, "run", fake_run)
+    tm = tool_map(tmp_path, Config(shell_timeout_s=30))
+
+    r = tm["shell"].fn({"command": "x", "timeout_s": -50})
+    assert r.ok
+    assert captured["timeout"] == 1  # negative clamps to floor instead of hanging
+
+    r = tm["shell"].fn({"command": "x", "timeout_s": 9999})
+    assert r.ok
+    assert captured["timeout"] == 30  # model may lower but never raise the limit
+
+    r = tm["shell"].fn({"command": "x"})
+    assert r.ok
+    assert captured["timeout"] == 30
+
+    bad = tm["shell"].fn({"command": "x", "timeout_s": "banana"})
+    assert not bad.ok and "integer" in bad.output
+    assert captured["timeout"] == 30  # rejected arg never reaches subprocess.run
+
+
+def test_shell_timeout_clamps_absurd_config_default(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(shell_mod.subprocess, "run", fake_run)
+    tm = tool_map(tmp_path, Config(shell_timeout_s=-5))
+    r = tm["shell"].fn({"command": "x"})
+    assert r.ok
+    assert captured["timeout"] == 1
+
+
+# --- 5d. fs resource limits -----------------------------------------------------
+def test_read_file_refuses_oversized_without_reading(tmp_path, monkeypatch):
+    (tmp_path / "huge.bin").write_bytes(b"x" * 16)
+    monkeypatch.setattr(fs_mod, "_MAX_READ_BYTES", 8)
+
+    def boom(self, *args, **kwargs):
+        raise AssertionError("read_file must refuse before reading content")
+
+    monkeypatch.setattr(pathlib.Path, "read_text", boom)
+    r = tool_map(tmp_path)["read_file"].fn({"path": "huge.bin"})
+    assert not r.ok
+    assert "too large" in r.output
+
+
+def test_list_files_prunes_deep_excluded_subtrees(tmp_path):
+    for sub in ("node_modules/leftpad/dist/es", ".git/objects/pack", "src/pkg/nested"):
+        (tmp_path / sub).mkdir(parents=True)
+    (tmp_path / "node_modules/leftpad/dist/es/index.js").write_text("j")
+    (tmp_path / ".git/objects/pack/x.pack").write_text("g")
+    (tmp_path / "src/a.py").write_text("a")
+    (tmp_path / "src/pkg/nested/deep.py").write_text("d")
+
+    tm = tool_map(tmp_path)
+    r = tm["list_files"].fn({})
+    assert r.ok
+    for junk in ("node_modules", ".git", ".pack", "index.js"):
+        assert junk not in r.output
+    for want in ("src/", "src/a.py", "src/pkg/", "src/pkg/nested/", "deep.py"):
+        assert want in r.output
+
+    py = tm["list_files"].fn({"pattern": "**/*.py"})
+    assert py.ok
+    assert "deep.py" in py.output and "a.py" in py.output
+    assert ".js" not in py.output
 
 
 # --- 6. websearch (offline via stub) ------------------------------------------

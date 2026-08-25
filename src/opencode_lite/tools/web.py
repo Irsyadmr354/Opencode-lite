@@ -5,8 +5,11 @@ Both are offline-tolerant and never raise: any failure becomes
 """
 from __future__ import annotations
 
+import ipaddress
 import pathlib
 import re
+import socket
+import urllib.parse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -20,6 +23,62 @@ except ImportError:  # pragma: no cover - exercised only without the package
 
 _USER_AGENT = "Mozilla/5.0 (compatible; opencode-lite/0.1)"
 _FETCH_TIMEOUT_S = 30
+_MAX_REDIRECT_HOPS = 5
+_MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
+# Read slightly past max_chars so HTML stripping still leaves enough text.
+_OVERSHOOT_CHARS = 4096
+
+
+def _host_blocked_reason(host: str) -> str | None:
+    """Return why *host* may not be contacted, or None when it is public.
+
+    Literal IPs are checked directly; names are resolved via ``getaddrinfo``
+    and every returned address must be globally reachable (blocks loopback,
+    LAN, link-local/metadata, reserved and unspecified targets).
+    """
+    host = host.strip().lower().rstrip(".")
+    if not host:
+        return "empty host"
+    if host == "localhost" or host.endswith(".localhost"):
+        return "loopback hostname 'localhost'"
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        addresses = [literal]
+    else:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except OSError as exc:
+            return f"dns resolution failed for '{host}' ({exc})"  # fail closed
+        addresses = []
+        for info in infos:
+            raw = str(info[4][0]).split("%", 1)[0]
+            try:
+                addresses.append(ipaddress.ip_address(raw))
+            except ValueError:
+                return f"unparseable dns record '{raw}' for '{host}'"
+        if not addresses:
+            return f"no dns records for '{host}'"
+    for addr in addresses:
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_unspecified
+        ):
+            return f"'{host}' resolves to non-public address {addr}"
+    return None
+
+
+def _hop_blocked_reason(url: str) -> str | None:
+    """SSRF gate applied to every fetched URL, including each redirect hop."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        return "only http/https URLs are supported"
+    return _host_blocked_reason(parts.hostname or "")
 
 
 # --- webfetch ----------------------------------------------------------------
@@ -40,16 +99,57 @@ def webfetch_tool(workspace: pathlib.Path, config) -> Tool:
             except (TypeError, ValueError):
                 return ToolResult(False, "ERROR: max_chars must be an integer")
 
-            resp = httpx.get(
-                url,
-                follow_redirects=True,
-                timeout=_FETCH_TIMEOUT_S,
-                headers={"User-Agent": _USER_AGENT},
-            )
-            if resp.status_code >= 400:
-                return ToolResult(False, f"ERROR: HTTP {resp.status_code} fetching {url}")
+            text = ""
+            current = url
+            # Manual redirect loop: every hop passes the SSRF gate before the
+            # request is made; TLS verification stays on (httpx default).
+            for hop in range(_MAX_REDIRECT_HOPS + 1):
+                reason = _hop_blocked_reason(current)
+                if reason is not None:
+                    return ToolResult(False, f"ERROR: blocked: {reason}: {current}")
+                with httpx.stream(
+                    "GET",
+                    current,
+                    follow_redirects=False,
+                    timeout=_FETCH_TIMEOUT_S,
+                    headers={"User-Agent": _USER_AGENT},
+                ) as resp:
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("location")
+                        if location is None:
+                            return ToolResult(
+                                False,
+                                f"ERROR: HTTP {resp.status_code} fetching {url}",
+                            )
+                        if hop >= _MAX_REDIRECT_HOPS:
+                            return ToolResult(
+                                False, f"ERROR: too many redirects fetching {url}"
+                            )
+                        current = urllib.parse.urljoin(current, location)
+                        continue
+                    if resp.status_code >= 400:
+                        return ToolResult(
+                            False, f"ERROR: HTTP {resp.status_code} fetching {url}"
+                        )
+                    declared = resp.headers.get("content-length")
+                    if declared and declared.isdigit():
+                        if int(declared) > _MAX_DOWNLOAD_BYTES:
+                            return ToolResult(
+                                False,
+                                f"ERROR: response too large ({declared} bytes > "
+                                f"{_MAX_DOWNLOAD_BYTES} byte limit)",
+                            )
+                    chunks: list[str] = []
+                    received = 0
+                    budget = max_chars + _OVERSHOOT_CHARS
+                    for chunk in resp.iter_text():
+                        chunks.append(chunk)
+                        received += len(chunk)
+                        if received >= budget:
+                            break  # stop buffering early; never read it all
+                    text = "".join(chunks)
+                    break
 
-            text = resp.text
             content_type = ""
             try:
                 content_type = str(resp.headers.get("content-type", ""))
