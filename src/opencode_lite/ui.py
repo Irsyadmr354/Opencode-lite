@@ -378,18 +378,20 @@ class TerminalHooks(Hooks):
                     flush_cur()
                     self._in_think = True
                     self._thinking_active = True
-                    self._write_stdout(f"{ANSI_THINKING}⠋ Thinking:{ANSI_RESET}\n")
+                    frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+                    self._spinner_idx += 1
+                    self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking...{ANSI_RESET}")
                     self._thinking_written = True
-                    self._thinking_lines += 1
                     i += 7
                     continue
                 elif lower.startswith("[thinking:"):
                     flush_cur()
                     self._in_bracket = True
                     self._thinking_active = True
-                    self._write_stdout(f"{ANSI_THINKING}⠋ Thinking:{ANSI_RESET}\n")
+                    frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+                    self._spinner_idx += 1
+                    self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking...{ANSI_RESET}")
                     self._thinking_written = True
-                    self._thinking_lines += 1
                     i += 10
                     continue
 
@@ -439,21 +441,26 @@ class TerminalHooks(Hooks):
             elif self._in_think:
                 lower = chunk[i:].lower()
                 if lower.startswith("</think>"):
-                    flush_cur(ANSI_THINKING)
                     self._in_think = False
                     self._collapse_thinking()
                     i += 8
                 else:
-                    cur.append(ch)
+                    # Rotate spinner frame on inner thinking chunks
+                    frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+                    self._spinner_idx += 1
+                    self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking...{ANSI_RESET}")
+                    self._thinking_written = True
                     i += 1
             elif self._in_bracket:
                 if ch == "]":
-                    flush_cur(ANSI_THINKING)
                     self._in_bracket = False
                     self._collapse_thinking()
                     i += 1
                 else:
-                    cur.append(ch)
+                    frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+                    self._spinner_idx += 1
+                    self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking...{ANSI_RESET}")
+                    self._thinking_written = True
                     i += 1
 
         if cur:
