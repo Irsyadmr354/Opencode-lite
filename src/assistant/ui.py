@@ -276,6 +276,13 @@ class TerminalHooks(Hooks):
         self._in_roleplay_asterisk: bool = False
         self._ai_prefix_printed: bool = False
         self.had_error: bool = False
+        self._workspace: Path | None = None
+        if config is not None and hasattr(config, "workspace"):
+            try:
+                self._workspace = Path(config.workspace)
+            except Exception:
+                self._workspace = None
+        self._current_args: dict | None = None
         self._pending_thread: threading.Thread | None = None
         self._pending_stop = threading.Event()
         self._pending_lock = threading.Lock()
@@ -647,6 +654,10 @@ class TerminalHooks(Hooks):
         """Clean inline tool execution indication: ⚡ [tool_name] args_summary."""
         summary = _format_args_summary(name, args)
         self._current_tool = (name, summary)
+        try:
+            self._current_args = dict(args) if isinstance(args, dict) else None
+        except Exception:
+            self._current_args = None
         if not self._last_char_was_newline:
             self._write_stdout("\n")
         self._write_stdout(f"{ANSI_YELLOW}⚡{ANSI_RESET} {ANSI_BOLD}[{name}]{ANSI_RESET} {summary}")
@@ -675,6 +686,39 @@ class TerminalHooks(Hooks):
             err_text = preview or "failed"
             self._write_stdout(f" -> {ANSI_RED}ERROR: {err_text}{ANSI_RESET}\n")
 
+        # Show file preview for write_file (lightweight, no model cost)
+        if ok and name == "write_file" and self._current_args is not None:
+            try:
+                pth = self._current_args.get("path") if isinstance(self._current_args, dict) else None
+                if pth:
+                    base = self._workspace if self._workspace is not None else Path.cwd()
+                    # Resolve safely inside workspace if possible
+                    try:
+                        fp = (base / str(pth)).resolve()
+                        # Only show if inside workspace or workspace unknown
+                        show = True
+                        if self._workspace is not None:
+                            try:
+                                fp.relative_to(base.resolve())
+                            except Exception:
+                                show = False
+                        if show and fp.is_file():
+                            lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+                            preview_n = min(20, len(lines))
+                            if preview_n:
+                                self._write_stdout(f"{ANSI_DIM}── {fp.name} preview ({preview_n}/{len(lines)} lines) ──{ANSI_RESET}\n")
+                                for idx, line in enumerate(lines[:20], start=1):
+                                    # Truncate long lines
+                                    if len(line) > 120:
+                                        line = line[:117] + "..."
+                                    self._write_stdout(f"{ANSI_DIM}{idx:>3}│{ANSI_RESET} {line}\n")
+                                if len(lines) > 20:
+                                    self._write_stdout(f"{ANSI_DIM}... +{len(lines)-20} more lines{ANSI_RESET}\n")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self._current_args = None
         self._current_tool = None
 
     def on_permission(self, name: str, args: dict) -> bool:
