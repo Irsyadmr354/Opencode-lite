@@ -1,6 +1,6 @@
 """Offline tests: headless console hooks — piped-stdin deny + interactive prompt.
 
-Covers the SEC-3 fix: when stdin is not a tty (e.g. ``opencode-lite -p`` with a
+Covers the SEC-3 fix: when stdin is not a tty (e.g. ``assistant -p`` with a
 piped script containing "y"), on_permission must DENY without ever calling
 input() or writing the prompt to stdout.
 """
@@ -20,8 +20,8 @@ for _p in (str(_ROOT / "src"),):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from opencode_lite.agent import Hooks  # noqa: E402
-from opencode_lite.__main__ import build_console_hooks  # noqa: E402
+from assistant.agent import Hooks  # noqa: E402
+from assistant.__main__ import build_console_hooks  # noqa: E402
 
 
 class FakeStdin:

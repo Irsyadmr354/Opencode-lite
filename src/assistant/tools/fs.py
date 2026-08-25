@@ -12,7 +12,7 @@ import pathlib
 import re
 from typing import Callable, Generator, Iterable
 
-from opencode_lite.tools import Tool, ToolResult
+from assistant.tools import Tool, ToolResult
 
 _EXCLUDED_PARTS = {".git", "__pycache__", "node_modules", ".venv", ".pytest_cache"}
 

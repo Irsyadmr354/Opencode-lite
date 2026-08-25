@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 from .config import Config
 from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for typing)
@@ -84,6 +85,25 @@ class Agent:
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.cancelled = False
+
+    # -- session persistence -------------------------------------------------
+
+    def save_session(self, name: str):
+        """Persist current conversation history to ``~/.assistant/sessions/<name>.json``."""
+        from . import session as _session  # lazy import to avoid circular
+
+        return _session.save_session(name, self.messages)
+
+    def load_session(self, name: str) -> None:
+        """Load conversation history from a saved session, replacing current messages."""
+        from . import session as _session  # lazy import to avoid circular
+
+        self.messages = _session.load_session(name)
+        self.cancelled = False
+
+    def new_session(self) -> None:
+        """Start a fresh session (alias for reset)."""
+        self.reset()
 
     # -- internals -----------------------------------------------------------
 
@@ -168,16 +188,20 @@ class Agent:
             output = str(res)
         return {"role": "tool", "tool_call_id": call.id, "content": output}
 
-    def _prune_context(self, max_tokens: int = 32000) -> None:
+    def _prune_context(self, max_tokens: int | None = None) -> None:
         """Prune oldest conversation units when over the token budget.
+
+        Prevents hallucination by dropping the oldest turns first while
+        preserving conversational coherence.
 
         A removable UNIT is either a single non-tool message, or an assistant
         message carrying tool_calls together with ALL immediately-following
-        contiguous ``role:"tool"`` results — so pruning can never orphan a
-        tool message (OpenAI-compatible servers reject those with HTTP 400).
-        The system prompt (index 0) and the newest user turn are never
-        removed.
+        contiguous role:tool results - so pruning can never orphan a tool
+        message (OpenAI-compatible servers reject those with HTTP 400). The
+        system prompt (index 0) and the newest user turn are never removed.
         """
+        if max_tokens is None:
+            max_tokens = int(getattr(self.config, "max_context_tokens", 12000))
         while len(self.messages) > 2 and self._approx_tokens() > max_tokens:
             newest_user = 0
             for idx, message in enumerate(self.messages):

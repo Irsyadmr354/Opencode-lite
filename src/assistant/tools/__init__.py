@@ -1,4 +1,4 @@
-"""Tool registry and shared tool contracts for opencode-lite.
+"""Tool registry and shared tool contracts for assistant.
 
 Contract (consumed by core/ and ui/):
     ToolResult(ok: bool, output: str)
@@ -7,7 +7,7 @@ Contract (consumed by core/ and ui/):
     openai_schema(tools) -> list[dict]
 
 ``config`` is duck-typed: ``config.limits.<field>`` and ``config.shell_cmd``.
-This package deliberately never imports ``opencode_lite.config``.
+This package deliberately never imports ``assistant.config``.
 
 NOTE: the dataclasses below are intentionally declared *before* the submodule
 imports; fs/shell/web bind ``Tool``/``ToolResult`` from the partially

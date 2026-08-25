@@ -1,4 +1,4 @@
-"""Configuration dataclasses and TOML/env/overrides loading for opencode-lite.
+"""Configuration dataclasses and TOML/env/overrides loading for assistant.
 
 Config is pure data: [permissions] values are normalized and validated here
 (allow|ask|deny), but enforcement of those decisions lives in the UI layer.
@@ -40,6 +40,7 @@ class Config:
     stream: bool = True
     verbose: bool = False
     timeout_s: int = 600
+    max_context_tokens: int = 12000
     limits: Limits = field(default_factory=Limits)
     permissions: Permissions = field(default_factory=Permissions)
     shell_cmd: list[str] = field(
@@ -58,6 +59,7 @@ _TOP_LEVEL_KEYS = {
     "stream",
     "verbose",
     "timeout_s",
+    "max_context_tokens",
     "shell_cmd",
 }
 
@@ -112,6 +114,10 @@ def _apply(cfg: Config, top: dict, limits: dict, permissions: dict) -> None:
         tv = top["timeout_s"]
         if not isinstance(tv, int) or tv <= 0:
             raise ValueError(f"invalid timeout_s value {tv!r}: expected positive int")
+    if "max_context_tokens" in top:
+        mct = top["max_context_tokens"]
+        if not isinstance(mct, int) or mct <= 0:
+            raise ValueError(f"invalid max_context_tokens value {mct!r}: expected positive int")
     for key, value in top.items():
         setattr(cfg, key, value)
     for key, value in limits.items():
@@ -146,6 +152,12 @@ def load_config(path: pathlib.Path | None = None, overrides: dict | None = None)
             cfg.timeout_s = int(env_timeout)
         except ValueError:
             raise ValueError(f"invalid OCLITE_TIMEOUT_S value {env_timeout!r}: expected int")
+    env_mct = os.environ.get("OCLITE_MAX_CONTEXT_TOKENS")
+    if env_mct is not None:
+        try:
+            cfg.max_context_tokens = int(env_mct)
+        except ValueError:
+            raise ValueError(f"invalid OCLITE_MAX_CONTEXT_TOKENS value {env_mct!r}: expected int")
 
     if overrides:
         top, limits, permissions = _split_mapping(overrides)

@@ -1,4 +1,4 @@
-# opencode-lite
+# assistant
 
 Minimal, opencode-like coding agent for **local models**. It runs a
 native-terminal chat REPL (or a headless one-shot mode) against an Ollama
@@ -18,16 +18,16 @@ your machine except optional web fetch/search.
 # 1. Pull a model (any model works; coder models recommended)
 ollama pull qwen2.5-coder:7b      # or qwen3:8b, etc.
 
-# 2. Install opencode-lite from the repo root
+# 2. Install assistant from the repo root
 pip install -e .
 ```
 
 ## Run
 
 ```powershell
-opencode-lite                      # interactive REPL (or: python -m opencode_lite)
-opencode-lite --model qwen3:8b     # override model
-opencode-lite -p "list python files"   # headless: answer, print, exit
+assistant                      # interactive REPL (or: python -m assistant)
+assistant --model qwen3:8b     # override model
+assistant -p "list python files"   # headless: answer, print, exit
 ```
 
 Headless mode streams the answer to stdout, logs tool calls/results, asks
@@ -52,7 +52,7 @@ prompt even for non-danger tools, `"allow"` runs silently.
 
 ## Permissions & config
 
-On first run a commented sample is written to `~/.opencode-lite/config.toml`.
+On first run a commented sample is written to `~/.assistant/config.toml`.
 Edit it to set defaults:
 
 ```toml
@@ -85,9 +85,27 @@ config file. `verbose` can also be set via TOML (`verbose = true`), env var `OCL
 ## REPL commands & keybindings
 
 Slash commands: `/help`, `/clear`, `/cls`, `/model [name]`, `/status`, `/verbose [on|off|status]`,
-`/exit` (also `/quit`).
+`/session [list|save <name>|load <name>|new|delete <name>]`, `/exit` (also `/quit`).
 
 Verbose mode (`verbose = true` or `--verbose`/`-v` or `/verbose on`) shows Ollama's technical performance stats after each turn (uses Ollama built-in `total_duration`, `prompt_eval_count`/`eval_count`, `prompt_eval_duration`/`eval_duration` → tokens/s when available, otherwise local wall time + estimated tokens). Toggle at runtime with `/verbose` (no arg toggles, `on`/`off` explicit, `status` shows current).
+
+### Sessions & pruning
+
+Conversation history is pruned automatically at **32000 tokens** (approx. `len(content)//4` per message). Pruning is type-aware: it drops the oldest turns first while keeping the system prompt and the newest user turn, and removes `assistant(tool_calls)` together with all following `tool` results as one atomic unit so no orphaned tool message ever reaches the server. This prevents hallucination by preserving coherence instead of silently truncating.
+
+Use `/session` to persist the (already pruned) history to disk under `~/.assistant/sessions/`:
+
+```
+/session                # status: messages, ~tokens, saved count + hint
+/session list           # list saved sessions (alias: ls)
+/session save mywork    # save current history as mywork.json
+/session load mywork    # restore history (replaces current messages)
+/session new            # clear screen & start fresh (alias: clear)
+/session delete mywork  # delete saved file (alias: rm)
+/session help           # usage
+```
+
+Sessions are plain JSON `{"messages": [...], "saved_at": "ISO8601"}` with indent 2. Save/load is not wasteful (no redundant copies) — pruning stays active and saved files contain exactly the pruned history you choose to keep.
 
 | Key | Action |
 |---|---|

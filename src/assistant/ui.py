@@ -1,4 +1,4 @@
-"""Pure Native Terminal REPL and UI for opencode-lite."""
+"""Pure Native Terminal REPL and UI for assistant."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, RichLog, Static
 
 try:
-    from opencode_lite.agent import Hooks
+    from assistant.agent import Hooks
 except ImportError:
     class Hooks:  # type: ignore[no-redef]
         def on_start(self) -> None: ...
@@ -715,6 +715,7 @@ def _get_help_text() -> str:
         f"    {ANSI_CYAN}/model [name]{ANSI_RESET}    View active model or switch to another Ollama model on the fly\n"
         f"    {ANSI_CYAN}/status{ANSI_RESET}          Show current workspace, model, base URL, and permissions\n"
         f"    {ANSI_CYAN}/verbose [on|off]{ANSI_RESET} Toggle verbose stats display (on/off/status)\n"
+        f"    {ANSI_CYAN}/session [list|save <name>|load <name>|new|delete <name>]{ANSI_RESET}  Manage sessions (pruned history saved to ~/.assistant/sessions/)\n"
         f"    {ANSI_CYAN}/exit, /quit{ANSI_RESET}     Exit assistant\n"
         f"\n"
         f"  {ANSI_BOLD}KEYBOARD SHORTCUTS:{ANSI_RESET}\n"
@@ -732,7 +733,7 @@ def _get_help_text() -> str:
         f"    * {ANSI_BOLD}websearch(query){ANSI_RESET}              Search the web via DuckDuckGo\n"
         f"\n"
         f"  {ANSI_BOLD}PERMISSIONS & CONFIGURATION:{ANSI_RESET}\n"
-        f"    Configuration file: ~/.opencode-lite/config.toml\n"
+        f"    Configuration file: ~/.assistant/config.toml\n"
         f"    Tool permissions can be set to: 'allow' | 'ask' | 'deny'\n"
         f"    Verbose stats use Ollama built-in when available (otherwise local estimate)\n"
         f"{ANSI_BOLD}=================================================================================={ANSI_RESET}\n"
@@ -748,7 +749,7 @@ def run_repl(
 ) -> None:
     """Run the pure native terminal REPL loop."""
     if config is None:
-        from opencode_lite.config import Config
+        from assistant.config import Config
         config = Config.load()
 
     # Enable ANSI escape sequences on Windows if possible
@@ -876,6 +877,133 @@ def run_repl(
                 else:
                     _print(f"{ANSI_RED}Usage: /verbose [on|off|status]{ANSI_RESET}")
                 continue
+            elif cmd in ("/session", "/sessions"):
+                try:
+                    from assistant import session as _sess  # type: ignore
+                except ImportError:
+                    try:
+                        import assistant.session as _sess  # type: ignore
+                    except ImportError as _e:
+                        hooks.on_error(f"session module not available: {_e}")
+                        continue
+                # Parse subcommand
+                sub_arg = arg.strip()
+                if not sub_arg:
+                    # Status view
+                    try:
+                        cnt = len(getattr(agent, "messages", []))
+                        try:
+                            toks = agent._approx_tokens() if hasattr(agent, "_approx_tokens") else 0
+                        except Exception:
+                            toks = 0
+                        saved = _sess.list_sessions()
+                        _print(f"{ANSI_DIM}Session: {cnt} messages, ~{toks} tokens{ANSI_RESET}")
+                        _print(f"{ANSI_DIM}Saved sessions: {len(saved)} on disk{ANSI_RESET}")
+                        if saved:
+                            _print(f"{ANSI_DIM}Saved: {', '.join(saved)}{ANSI_RESET}")
+                        _print(f"{ANSI_DIM}Hint: /session save <name> | load <name> | list | new | delete <name>{ANSI_RESET}")
+                    except Exception as exc:
+                        hooks.on_error(str(exc))
+                    continue
+                # split subcommand and remainder name
+                _parts = sub_arg.split(maxsplit=1)
+                sub = _parts[0].lower()
+                rest = _parts[1].strip() if len(_parts) > 1 else ""
+                if sub in ("list", "ls"):
+                    try:
+                        sessions = _sess.list_sessions()
+                        if not sessions:
+                            _print(f"{ANSI_DIM}(no saved sessions){ANSI_RESET}")
+                        else:
+                            for s in sessions:
+                                _print(f"{ANSI_DIM}{s}{ANSI_RESET}")
+                    except Exception as exc:
+                        hooks.on_error(str(exc))
+                    continue
+                elif sub == "save":
+                    if not rest:
+                        hooks.on_error("Usage: /session save <name>")
+                        _print(f"{ANSI_RED}Usage: /session save <name>{ANSI_RESET}")
+                        continue
+                    try:
+                        if hasattr(agent, "save_session"):
+                            agent.save_session(rest)
+                        else:
+                            _sess.save_session(rest, getattr(agent, "messages", []))
+                        n = len(getattr(agent, "messages", []))
+                        _print(f"{ANSI_DIM}Session saved: {rest} ({n} messages){ANSI_RESET}")
+                    except (ValueError, FileNotFoundError, OSError) as exc:
+                        hooks.on_error(str(exc))
+                    except Exception as exc:
+                        hooks.on_error(f"{type(exc).__name__}: {exc}")
+                    continue
+                elif sub == "load":
+                    if not rest:
+                        hooks.on_error("Usage: /session load <name>")
+                        _print(f"{ANSI_RED}Usage: /session load <name>{ANSI_RESET}")
+                        continue
+                    try:
+                        if hasattr(agent, "load_session"):
+                            agent.load_session(rest)
+                        else:
+                            msgs = _sess.load_session(rest)
+                            agent.messages = msgs
+                            if hasattr(agent, "cancelled"):
+                                agent.cancelled = False
+                        n = len(getattr(agent, "messages", []))
+                        _print(f"{ANSI_DIM}Session loaded: {rest} ({n} messages){ANSI_RESET}")
+                    except FileNotFoundError as exc:
+                        hooks.on_error(str(exc))
+                    except ValueError as exc:
+                        hooks.on_error(str(exc))
+                    except Exception as exc:
+                        hooks.on_error(f"{type(exc).__name__}: {exc}")
+                    continue
+                elif sub in ("new", "clear"):
+                    try:
+                        _clear_screen()
+                        if hasattr(agent, "new_session"):
+                            agent.new_session()
+                        elif hasattr(agent, "reset"):
+                            agent.reset()
+                        elif hasattr(agent, "messages"):
+                            try:
+                                agent.messages.clear()
+                            except Exception:
+                                agent.messages = []
+                        _print(f"{ANSI_DIM}New session started{ANSI_RESET}")
+                    except Exception as exc:
+                        hooks.on_error(str(exc))
+                    continue
+                elif sub in ("delete", "rm", "remove"):
+                    if not rest:
+                        hooks.on_error("Usage: /session delete <name>")
+                        _print(f"{ANSI_RED}Usage: /session delete <name>{ANSI_RESET}")
+                        continue
+                    try:
+                        _sess.delete_session(rest)
+                        _print(f"{ANSI_DIM}Session deleted: {rest}{ANSI_RESET}")
+                    except FileNotFoundError as exc:
+                        hooks.on_error(str(exc))
+                    except ValueError as exc:
+                        hooks.on_error(str(exc))
+                    except Exception as exc:
+                        hooks.on_error(f"{type(exc).__name__}: {exc}")
+                    continue
+                elif sub == "help":
+                    _print(f"{ANSI_DIM}Usage:{ANSI_RESET}")
+                    _print(f"  {ANSI_CYAN}/session{ANSI_RESET}               Show current session status")
+                    _print(f"  {ANSI_CYAN}/session list{ANSI_RESET}          List saved sessions")
+                    _print(f"  {ANSI_CYAN}/session save <name>{ANSI_RESET}   Save current session")
+                    _print(f"  {ANSI_CYAN}/session load <name>{ANSI_RESET}   Load saved session")
+                    _print(f"  {ANSI_CYAN}/session new{ANSI_RESET}           Start new session (clear)")
+                    _print(f"  {ANSI_CYAN}/session delete <name>{ANSI_RESET} Delete saved session")
+                    _print(f"  {ANSI_DIM}Sessions stored in ~/.assistant/sessions/{ANSI_RESET}")
+                    continue
+                else:
+                    hooks.on_error(f"Unknown /session subcommand '{sub}'. Try /session help")
+                    _print(f"{ANSI_RED}Unknown /session subcommand '{sub}'. Try /session help{ANSI_RESET}")
+                    continue
             else:
                 _print(f"{ANSI_RED}Unknown command '{cmd}'. Type /help for available commands.{ANSI_RESET}\n")
                 continue
@@ -967,7 +1095,7 @@ class PermissionModal(ModalScreen[bool]):
 class ChatApp(App[None]):
     """Compatibility Textual App export."""
 
-    TITLE = "opencode-lite"
+    TITLE = "assistant"
 
     def __init__(self, agent: Any, config: Any) -> None:
         super().__init__()

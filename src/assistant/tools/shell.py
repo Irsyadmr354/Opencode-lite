@@ -9,7 +9,7 @@ from __future__ import annotations
 import pathlib
 import subprocess
 
-from opencode_lite.tools import Tool, ToolResult
+from assistant.tools import Tool, ToolResult
 
 # Model-supplied timeouts are clamped into [1, config.limits.shell_timeout_s]:
 # a model may lower the timeout but never raise it. On Windows, subprocess.run

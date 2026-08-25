@@ -14,11 +14,11 @@ for _p in (str(_ROOT / "src"), str(_HERE)):
 
 from fake_ollama import FakeOllama
 
-import opencode_lite.ui as ui_mod
-from opencode_lite.agent import Agent, Hooks
-from opencode_lite.config import load_config
-from opencode_lite.llm import LLMClient
-from opencode_lite.tools import get_tools
+import assistant.ui as ui_mod
+from assistant.agent import Agent, Hooks
+from assistant.config import load_config
+from assistant.llm import LLMClient
+from assistant.tools import get_tools
 
 
 def _collect(base_url: str, **kw):

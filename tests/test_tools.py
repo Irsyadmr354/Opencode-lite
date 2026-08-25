@@ -1,4 +1,4 @@
-"""Offline tests for opencode_lite.tools (fs / shell / web).
+"""Offline tests for assistant.tools (fs / shell / web).
 
 No network access: webfetch and websearch are exercised via monkeypatched
 fakes/stubs. Self-sufficient sys.path setup (does not depend on conftest.py).
@@ -16,14 +16,14 @@ _SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from opencode_lite.tools import (  # noqa: E402
+from assistant.tools import (  # noqa: E402
     ToolResult,
     get_tools,
     openai_schema,
 )
-from opencode_lite.tools import fs as fs_mod  # noqa: E402
-from opencode_lite.tools import shell as shell_mod  # noqa: E402
-from opencode_lite.tools import web as web_mod  # noqa: E402
+from assistant.tools import fs as fs_mod  # noqa: E402
+from assistant.tools import shell as shell_mod  # noqa: E402
+from assistant.tools import web as web_mod  # noqa: E402
 
 
 # --- duck-typed config stubs --------------------------------------------------

@@ -16,9 +16,9 @@ for _p in (str(_ROOT / "src"), str(_HERE)):
 
 from fake_ollama import FakeOllama  # noqa: E402
 
-from opencode_lite.agent import SYSTEM_PROMPT, Agent, Hooks  # noqa: E402
-from opencode_lite.config import Config, load_config  # noqa: E402
-from opencode_lite.llm import LLMClient, LLMError  # noqa: E402
+from assistant.agent import SYSTEM_PROMPT, Agent, Hooks  # noqa: E402
+from assistant.config import Config, load_config  # noqa: E402
+from assistant.llm import LLMClient, LLMError  # noqa: E402
 
 
 # --- helpers -----------------------------------------------------------------

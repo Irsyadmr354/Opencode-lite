@@ -15,11 +15,11 @@ for _p in (str(_ROOT / "src"), str(_HERE)):
 
 from fake_ollama import FakeOllama  # noqa: E402
 
-import opencode_lite.ui as ui_mod  # noqa: E402
-from opencode_lite.agent import Agent, Hooks  # noqa: E402
-from opencode_lite.config import load_config  # noqa: E402
-from opencode_lite.llm import LLMClient  # noqa: E402
-from opencode_lite.tools import get_tools  # noqa: E402
+import assistant.ui as ui_mod  # noqa: E402
+from assistant.agent import Agent, Hooks  # noqa: E402
+from assistant.config import load_config  # noqa: E402
+from assistant.llm import LLMClient  # noqa: E402
+from assistant.tools import get_tools  # noqa: E402
 
 
 class TrackingHooks(Hooks):

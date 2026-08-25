@@ -19,7 +19,7 @@ for _p in (str(_ROOT / "src"),):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from opencode_lite.config import Config, Permissions, load_config  # noqa: E402
+from assistant.config import Config, Permissions, load_config  # noqa: E402
 
 
 def _write_config(tmp_path: Path, body: str) -> Path:

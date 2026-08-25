@@ -1,4 +1,4 @@
-"""Command-line entry point for opencode-lite (TUI + headless modes)."""
+"""Command-line entry point for assistant (TUI + headless modes)."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any
 
 VERSION = "0.1.0"
-DEFAULT_CONFIG_PATH = Path.home() / ".opencode-lite" / "config.toml"
+DEFAULT_CONFIG_PATH = Path.home() / ".assistant" / "config.toml"
 
 SAMPLE_CONFIG = '''\
-# opencode-lite configuration (sample, written once)
+# assistant configuration (sample, written once)
 # All keys optional; unset values fall back to built-in defaults.
 
 model = "qwen2.5-coder:7b"              # any model available in Ollama
@@ -23,6 +23,7 @@ max_tool_rounds = 12                    # default: 25
 stream = true                           # stream assistant tokens
 verbose = false                         # show Ollama performance stats after each turn
 timeout_s = 600                         # request timeout in seconds (potato: 600)
+max_context_tokens = 12000              # pruning limit, match your 12k local model
 # workspace = ""                        # empty -> directory you launch from
 # shell_cmd = ["powershell", "-NoProfile", "-Command"]  # Windows default
 
@@ -222,10 +223,10 @@ def build_console_hooks(hooks_base: type) -> type:
 
 def load_runtime():
     """Import sibling modules; returns tuple or raises ImportError."""
-    from opencode_lite.agent import Agent, Hooks
-    from opencode_lite.config import load_config
-    from opencode_lite.llm import LLMClient
-    from opencode_lite.tools import get_tools
+    from assistant.agent import Agent, Hooks
+    from assistant.config import load_config
+    from assistant.llm import LLMClient
+    from assistant.tools import get_tools
 
     return load_config, LLMClient, Agent, Hooks, get_tools
 
@@ -245,7 +246,7 @@ def ensure_sample_config(config_path: Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="opencode-lite",
+        prog="assistant",
         description="Minimal TUI coding agent for local models (Ollama).",
     )
     parser.add_argument(
@@ -283,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     ns = parser.parse_args(argv)
 
     if ns.version:
-        print(f"opencode-lite {VERSION}")
+        print(f"assistant {VERSION}")
         return 0
 
     # Sibling modules are built in parallel; fail with a clear message, never at import time.
@@ -291,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         load_config, LLMClient, Agent, Hooks, get_tools = load_runtime()
     except ImportError as exc:
         print(f"ERROR: core modules not available yet ({exc}). Run 'pip install -e .' "
-              f"and ensure all opencode_lite modules are present.", file=sys.stderr)
+              f"and ensure all assistant modules are present.", file=sys.stderr)
         return 2
 
     config_path = Path(ns.config).expanduser()
@@ -322,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         agent.submit(ns.print_mode)
         return 1 if console_hooks.had_error else 0
 
-    from opencode_lite.ui import run_repl
+    from assistant.ui import run_repl
 
     agent = Agent(client, tools, config, Hooks())
     try:

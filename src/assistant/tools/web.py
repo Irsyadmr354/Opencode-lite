@@ -14,14 +14,14 @@ import urllib.parse
 import httpx
 from bs4 import BeautifulSoup
 
-from opencode_lite.tools import Tool, ToolResult
+from assistant.tools import Tool, ToolResult
 
 try:  # optional runtime dependency; missing ddgs must not break tool loading
     from ddgs import DDGS
 except ImportError:  # pragma: no cover - exercised only without the package
     DDGS = None  # type: ignore[assignment]
 
-_USER_AGENT = "Mozilla/5.0 (compatible; opencode-lite/0.1)"
+_USER_AGENT = "Mozilla/5.0 (compatible; assistant/0.1)"
 _FETCH_TIMEOUT_S = 30
 _MAX_REDIRECT_HOPS = 5
 _MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
