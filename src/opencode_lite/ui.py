@@ -361,11 +361,12 @@ class TerminalHooks(Hooks):
                         self._thinking_lines += joined.count("\n")
                 else:
                     if not self._ai_prefix_printed and not self._in_think and not self._in_bracket:
-                        # Print [AI]: prefix before first content token
+                        # Print Assistant prefix right where thinking was collapsed
                         clean_check = joined.lstrip()
                         if clean_check:
                             self._write_stdout(AI_PREFIX)
                             self._ai_prefix_printed = True
+                            joined = clean_check
                     self._write_stdout(joined)
                 cur.clear()
 
