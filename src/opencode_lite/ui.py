@@ -258,6 +258,7 @@ class TerminalHooks(Hooks):
         self._thinking_active: bool = False
         self._thinking_written: bool = False
         self._thinking_lines: int = 0
+        self._spinner_idx: int = 0
         self._current_tool: tuple[str, str] | None = None
         self._last_char_was_newline: bool = True
         self._at_line_start: bool = True
@@ -279,16 +280,12 @@ class TerminalHooks(Hooks):
         self._stderr.flush()
 
     def _collapse_thinking(self) -> None:
-        """Collapse and erase streamed thinking from the terminal screen."""
+        """Collapse and erase streamed thinking spinner from the terminal screen."""
         if not self._thinking_active and not self._saw_reasoning:
             return
         if self._thinking_written:
-            # Clear current line
-            erase_seq = "\r\033[2K"
-            if self._thinking_lines > 0:
-                erase_seq += "\033[1A\033[2K" * self._thinking_lines
-            erase_seq += "\r"
-            self._write_stdout(f"{ANSI_RESET}{erase_seq}")
+            # Clear the single spinner line in-place
+            self._write_stdout(f"\r\033[2K{ANSI_RESET}")
         else:
             self._write_stdout(ANSI_RESET)
 
@@ -315,18 +312,15 @@ class TerminalHooks(Hooks):
         self._ai_prefix_printed = False
 
     def on_reasoning(self, text: str) -> None:
-        """Real-time streaming for dedicated reasoning field in italic dim cyan."""
+        """Live in-place rotating spinner on each reasoning chunk."""
         if not text:
             return
-        if not self._saw_reasoning:
-            self._saw_reasoning = True
-            self._thinking_active = True
-            self._write_stdout(f"{ANSI_THINKING}⠋ Thinking:{ANSI_RESET}\n")
-            self._thinking_written = True
-            self._thinking_lines += 1
-        self._write_stdout(f"{ANSI_THINKING}{text}{ANSI_RESET}")
+        self._saw_reasoning = True
+        self._thinking_active = True
+        frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+        self._spinner_idx += 1
+        self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking...{ANSI_RESET}")
         self._thinking_written = True
-        self._thinking_lines += text.count("\n")
 
     def on_delta(self, text: str) -> None:
         """Real-time word-by-word streaming directly to stdout, collapsing thinking on transition."""

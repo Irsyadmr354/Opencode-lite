@@ -130,8 +130,7 @@ def test_ui_renders_reasoning_field():
 
     output = out.getvalue()
     assert ui_mod.ANSI_THINKING in output
-    assert "thinking hard" in output
-    assert "about it" in output
+    assert "Thinking..." in output
     assert "answer here" in output
 
 
@@ -146,7 +145,6 @@ def test_ui_split_tag_no_leak():
     output = out.getvalue()
     assert "I wonder " in output
     assert ui_mod.ANSI_THINKING in output
-    assert "secret plan" in output
     assert "so, proceed" in output
     # Must not have raw tag literals leaked in output
     assert "<think>" not in output
@@ -158,16 +156,15 @@ def test_ui_collapses_thinking_on_transition_to_content():
     out = io.StringIO()
     hooks = ui_mod.TerminalHooks(stdout=out)
     hooks.on_reasoning("analyzing the code\nfinding bugs")
-    # At this point, thinking text is streamed
-    assert "analyzing the code" in out.getvalue()
+    # At this point, thinking spinner is streamed
+    assert "Thinking..." in out.getvalue()
     # Transition to normal delta triggers collapse
     hooks.on_delta("Here is the fix.")
     hooks.on_assistant_done(SimpleNamespace(content="Here is the fix."))
 
     output = out.getvalue()
-    # ANSI clear line code \033[2K and cursor movement \033[1A must be present
+    # ANSI clear line code \033[2K must be present
     assert "\033[2K" in output
-    assert "\033[1A" in output
     assert "Here is the fix." in output
 
 
