@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 
 import httpx
@@ -22,6 +23,7 @@ class AssistantTurn:
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
     reasoning: str | None = None
+    stats: dict | None = None
 
 
 class LLMError(Exception):
@@ -65,7 +67,7 @@ class LLMClient:
         self.timeout_s = timeout_s
 
     def chat_stream(self, messages: list[dict], tools_schema: list[dict] | None = None,
-                    cancel=None):
+                     cancel=None):
         """Yield {"type": "delta"|"reasoning", "text": ...} chunks then
         {"type": "final", "turn": ...}. Reasoning deltas come from the
         ``reasoning``/``reasoning_content`` fields some runtimes use for
@@ -75,6 +77,27 @@ class LLMClient:
         mid-stream the response is closed and a final turn with whatever was
         accumulated is still yielded.
         """
+        t_start = time.monotonic()
+        ollama_stats: dict = {}
+        usage: dict | None = None
+
+        def _capture_ollama(obj: dict) -> None:
+            nonlocal ollama_stats, usage
+            if not isinstance(obj, dict):
+                return
+            for k in ("total_duration", "load_duration", "prompt_eval_count",
+                      "prompt_eval_duration", "eval_count", "eval_duration", "timings"):
+                if k in obj:
+                    ollama_stats[k] = obj[k]
+            if "done" in obj and isinstance(obj["done"], bool):
+                ollama_stats["done"] = obj["done"]
+            if "usage" in obj and isinstance(obj["usage"], dict):
+                usage = obj["usage"]
+            # Some providers may emit prompt_tokens etc at top level
+            # without wrapping in usage – capture as usage fallback.
+            if usage is None and any(k in obj for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
+                usage = {k: obj[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in obj}
+
         payload: dict = {"model": self.model, "messages": messages, "stream": True}
         if tools_schema:
             payload["tools"] = tools_schema
@@ -104,6 +127,21 @@ class LLMClient:
                         if isinstance(line, bytes):
                             line = line.decode("utf-8", "replace")
                         raw_lines.append(line)
+                        # Capture stats from bare NDJSON lines (native Ollama) before SSE check.
+                        # Only capture ollama stats here; content handling for bare NDJSON is deferred
+                        # to the non-streaming fallback to avoid double-yield when the body is
+                        # a single JSON object (e.g., FakeOllama raw_json).
+                        _stripped = line.strip()
+                        if _stripped.startswith("{"):
+                            try:
+                                _nd = json.loads(_stripped)
+                                _capture_ollama(_nd)
+                                # For true streaming NDJSON (not SSE), also capture stats but don't
+                                # yield content here – the SSE path handles streaming content.
+                                # Native Ollama NDJSON content will be handled if we ever need to,
+                                # but stats capture is the primary goal for verbose mode.
+                            except json.JSONDecodeError:
+                                pass
                         if not line.startswith("data:"):
                             continue
                         saw_sse = True
@@ -114,6 +152,7 @@ class LLMClient:
                             obj = json.loads(data)
                         except json.JSONDecodeError:
                             continue
+                        _capture_ollama(obj)
                         choices = obj.get("choices") or []
                         if not choices:
                             continue
@@ -148,8 +187,14 @@ class LLMClient:
                         body = "\n".join(raw_lines).strip()
                         try:
                             obj = json.loads(body)
+                            _capture_ollama(obj)
                             choice = (obj.get("choices") or [{}])[0]
                             message = choice.get("message") or {}
+                            # Also capture stats that might be nested inside choice/message
+                            if isinstance(choice, dict):
+                                _capture_ollama(choice)
+                            if isinstance(message, dict):
+                                _capture_ollama(message)
                         except (json.JSONDecodeError, AttributeError) as exc:
                             raise LLMError(f"invalid non-streaming response: {exc}") from exc
                         thought = (message.get("reasoning")
@@ -235,8 +280,14 @@ class LLMClient:
         if reasoning_text is None and inline_thoughts.strip():
             reasoning_text = inline_thoughts
 
+        wall_duration_s = time.monotonic() - t_start
+        stats: dict = {
+            "wall_duration_s": wall_duration_s,
+            "ollama": ollama_stats or None,
+            "usage": usage,
+        }
         turn = AssistantTurn(
             content=clean_content if clean_content.strip() else None,
             tool_calls=tool_calls, finish_reason=finish_reason,
-            reasoning=reasoning_text)
+            reasoning=reasoning_text, stats=stats)
         yield {"type": "final", "turn": turn}

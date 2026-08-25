@@ -38,6 +38,7 @@ class Config:
     workspace: pathlib.Path = field(default_factory=pathlib.Path.cwd)
     max_tool_rounds: int = 25
     stream: bool = True
+    verbose: bool = False
     limits: Limits = field(default_factory=Limits)
     permissions: Permissions = field(default_factory=Permissions)
     shell_cmd: list[str] = field(
@@ -54,6 +55,7 @@ _TOP_LEVEL_KEYS = {
     "workspace",
     "max_tool_rounds",
     "stream",
+    "verbose",
     "shell_cmd",
 }
 
@@ -100,6 +102,10 @@ def _split_mapping(raw: dict | None) -> tuple[dict, dict, dict]:
 
 def _apply(cfg: Config, top: dict, limits: dict, permissions: dict) -> None:
     workspace = top.pop("workspace", None)
+    if "verbose" in top:
+        v = top["verbose"]
+        if not isinstance(v, bool):
+            raise ValueError(f"invalid verbose value {v!r}: expected bool")
     for key, value in top.items():
         setattr(cfg, key, value)
     for key, value in limits.items():
@@ -125,6 +131,9 @@ def load_config(path: pathlib.Path | None = None, overrides: dict | None = None)
     env_base_url = os.environ.get("OCLITE_BASE_URL")
     if env_base_url:
         cfg.base_url = env_base_url
+    env_verbose = os.environ.get("OCLITE_VERBOSE")
+    if env_verbose is not None:
+        cfg.verbose = env_verbose.strip().lower() in ("1", "true", "yes")
 
     if overrides:
         top, limits, permissions = _split_mapping(overrides)

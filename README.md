@@ -61,6 +61,7 @@ base_url = "http://127.0.0.1:11434/v1"
 api_key = "ollama"
 max_tool_rounds = 12     # default: 25
 stream = true
+verbose = false          # show Ollama performance stats after each turn
 
 [permissions]
 # "allow" | "ask" | "deny"
@@ -78,13 +79,15 @@ websearch = "allow"
 # list_max_entries = 200
 ```
 
-CLI flags (`--model`, `--base-url`, `--workspace`, `--config`) override the
-config file.
+CLI flags (`--model`, `--base-url`, `--workspace`, `--config`, `--verbose`/`-v`) override the
+config file. `verbose` can also be set via TOML (`verbose = true`), env var `OCLITE_VERBOSE=1` (`1`/`true`/`yes` → on), or `/verbose` toggle in the REPL.
 
 ## REPL commands & keybindings
 
-Slash commands: `/help`, `/clear`, `/cls`, `/model [name]`, `/status`,
+Slash commands: `/help`, `/clear`, `/cls`, `/model [name]`, `/status`, `/verbose [on|off|status]`,
 `/exit` (also `/quit`).
+
+Verbose mode (`verbose = true` or `--verbose`/`-v` or `/verbose on`) shows Ollama's technical performance stats after each turn (uses Ollama built-in `total_duration`, `prompt_eval_count`/`eval_count`, `prompt_eval_duration`/`eval_duration` → tokens/s when available, otherwise local wall time + estimated tokens). Toggle at runtime with `/verbose` (no arg toggles, `on`/`off` explicit, `status` shows current).
 
 | Key | Action |
 |---|---|

@@ -145,7 +145,7 @@ def test_ui_renders_reasoning_field():
     assert "\r\033[2K\033[1A\033[2K\r" in output
     assert ui_mod.SPINNER_FRAMES[2] + " Thinking" in output  # spinner advanced on delta
     assert "answer here" in output
-    assert "\033[u" in output                                # cursor restored after redraw
+    assert "\033[1A" in output and "\033[1B" in output       # explicit up/down restore (no save/restore)
 
     hooks.on_assistant_done(
         SimpleNamespace(content="answer here", reasoning="thinking hard\nabout it"))
@@ -250,9 +250,9 @@ def test_ui_spinner_guard_tiny_viewport(monkeypatch):
     hooks.on_delta("A")
     hooks.on_assistant_done(SimpleNamespace(content="A"))
     output = out.getvalue()
-    # Erase clamped to lines-2 = 3 rows: exactly two up-moves, never more.
+    # Erase clamped to lines-2 = 3 rows: exactly two up-moves for erase + one for header rewrite.
     assert "\r\033[2K\033[1A\033[2K\033[1A\033[2K\r" in output
-    assert output.count("\033[1A") == 2
+    assert output.count("\033[1A") == 3
     assert "A" in output
 
 
@@ -264,7 +264,7 @@ def test_ui_spinner_freezes_on_done():
     hooks.on_delta("ans")
     output = out.getvalue()
     assert ui_mod.SPINNER_FRAMES[2] + " Thinking" in output  # spun during answer phase
-    assert "\033[s" in output and "\033[u" in output         # in-place header redraws
+    assert "\033[1A" in output and "\033[1B" in output       # explicit up/down header redraws
 
     hooks.on_assistant_done(SimpleNamespace(content="ans"))
     snapshot = out.getvalue()

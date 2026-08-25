@@ -21,6 +21,7 @@ base_url = "http://127.0.0.1:11434/v1"  # Ollama OpenAI-compatible endpoint
 api_key = "ollama"                      # placeholder; local servers ignore it
 max_tool_rounds = 12                    # default: 25
 stream = true                           # stream assistant tokens
+verbose = false                         # show Ollama performance stats after each turn
 # workspace = ""                        # empty -> directory you launch from
 # shell_cmd = ["powershell", "-NoProfile", "-Command"]  # Windows default
 
@@ -46,8 +47,106 @@ def build_console_hooks(hooks_base: type) -> type:
     """Create the concrete ConsoleHooks class bound to the given Hooks base."""
 
     class ConsoleHooksImpl(hooks_base):
-        def __init__(self) -> None:
+        def __init__(self, verbose: bool = False) -> None:
             self.had_error = False
+            self.verbose: bool = bool(verbose)
+
+        def _format_verbose(self, turn) -> str:
+            stats = getattr(turn, "stats", None)
+            if stats is None and isinstance(turn, dict):
+                stats = turn.get("stats")
+            if not stats:
+                return "(no stats)"
+
+            def _get(key: str, default=None):
+                if isinstance(stats, dict):
+                    if key in stats:
+                        return stats[key]
+                    ollama = stats.get("ollama")
+                    if isinstance(ollama, dict) and key in ollama:
+                        return ollama[key]
+                    return default
+                else:
+                    if hasattr(stats, key):
+                        return getattr(stats, key)
+                    ollama = getattr(stats, "ollama", None)
+                    if ollama is not None:
+                        if isinstance(ollama, dict) and key in ollama:
+                            return ollama[key]
+                        if hasattr(ollama, key):
+                            return getattr(ollama, key)
+                    return default
+
+            parts = ["verbose"]
+            wall = _get("wall_duration_s")
+            if wall is not None:
+                try:
+                    parts.append(f"wall {float(wall):.1f}s")
+                except Exception:
+                    pass
+            prompt_count = _get("prompt_eval_count")
+            prompt_dur = _get("prompt_eval_duration")
+            if prompt_count is not None:
+                try:
+                    pc = int(prompt_count)
+                    if prompt_dur is not None:
+                        pd_s = float(prompt_dur) / 1e9 if float(prompt_dur) > 1e6 else float(prompt_dur)
+                        parts.append(f"prompt {pc} tok ({pd_s:.2f}s)")
+                    else:
+                        parts.append(f"prompt {pc} tok")
+                except Exception:
+                    pass
+            eval_count = _get("eval_count")
+            eval_dur = _get("eval_duration")
+            if eval_count is not None:
+                try:
+                    ec = int(eval_count)
+                    if eval_dur is not None:
+                        ed_s = float(eval_dur) / 1e9 if float(eval_dur) > 1e6 else float(eval_dur)
+                        if ed_s > 0:
+                            tok_per_s = ec / ed_s
+                            parts.append(f"eval {ec} tok {tok_per_s:.2f}tok/s")
+                        else:
+                            parts.append(f"eval {ec} tok")
+                    else:
+                        parts.append(f"eval {ec} tok")
+                except Exception:
+                    pass
+            total_dur = _get("total_duration")
+            if total_dur is not None:
+                try:
+                    td = float(total_dur)
+                    td_s = td / 1e9 if td > 1e6 else td
+                    if td_s >= 1:
+                        parts.append(f"total {td_s:.1f}s")
+                    else:
+                        parts.append(f"total {td_s*1000:.1f}ms")
+                except Exception:
+                    pass
+            load_dur = _get("load_duration")
+            if load_dur is not None:
+                try:
+                    ld = float(load_dur)
+                    if ld > 1e6:
+                        parts.append(f"load {ld/1e6:.1f}ms")
+                    elif ld > 1e3:
+                        parts.append(f"load {ld:.1f}ms")
+                    else:
+                        parts.append(f"load {ld:.2f}s")
+                except Exception:
+                    pass
+            if prompt_count is None and eval_count is None:
+                approx = _get("approx_tokens")
+                if approx is None:
+                    approx = _get("approx_tokens_before")
+                if approx is not None:
+                    try:
+                        parts.append(f"~{int(approx)} tok")
+                    except Exception:
+                        pass
+            if len(parts) == 1:
+                return "(no stats)"
+            return " | ".join(parts)
 
         def on_delta(self, text: str) -> None:
             sys.stdout.write(text)
@@ -65,8 +164,16 @@ def build_console_hooks(hooks_base: type) -> type:
                 content = turn
             else:
                 content = getattr(turn, "text", "")
+                if content is None:
+                    content = getattr(turn, "content", "")
             if isinstance(content, str) and content and not content.endswith("\n"):
                 print()
+            if getattr(self, "verbose", False):
+                try:
+                    line = self._format_verbose(turn)
+                except Exception:
+                    line = "(no stats)"
+                print(f"\033[2m⏱ {line}\033[0m", file=sys.stderr, flush=True)
 
         def on_tool_start(self, name: str, args: dict) -> None:
             try:
@@ -157,6 +264,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TEXT",
         help="headless mode: run TEXT non-interactively, print result, exit",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="show Ollama performance stats after each response",
+    )
     return parser
 
 
@@ -185,6 +298,8 @@ def main(argv: list[str] | None = None) -> int:
         overrides["model"] = ns.model
     if ns.base_url:
         overrides["base_url"] = ns.base_url
+    if getattr(ns, "verbose", False):
+        overrides["verbose"] = True
     overrides["workspace"] = Path(ns.workspace or ".").expanduser().resolve()
 
     try:
@@ -197,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     tools = get_tools(config.workspace, config)
 
     if ns.print_mode is not None:
-        console_hooks = build_console_hooks(Hooks)()
+        console_hooks = build_console_hooks(Hooks)(verbose=bool(getattr(config, "verbose", False)))
         agent = Agent(client, tools, config, console_hooks)
         agent.submit(ns.print_mode)
         return 1 if console_hooks.had_error else 0

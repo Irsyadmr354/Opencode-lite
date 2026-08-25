@@ -247,6 +247,8 @@ class TerminalHooks(Hooks):
         stdout: TextIO | None = None,
         stderr: TextIO | None = None,
         input_fn: Callable[[str], str] | None = None,
+        verbose: bool = False,
+        config: Any | None = None,
     ) -> None:
         super().__init__()
         self._stdout: TextIO = stdout if stdout is not None else sys.stdout
@@ -263,12 +265,116 @@ class TerminalHooks(Hooks):
         self._below_started: bool = False    # any text written below the header yet
         self._below_rows: int = 0            # PHYSICAL rows consumed below the header
         self._below_col: int = 0             # cursor column within the last physical row
+        self._cursor_on_header: bool = False  # True when cursor is still on the header line itself
         self._current_tool: tuple[str, str] | None = None
         self._last_char_was_newline: bool = True
         self._at_line_start: bool = True
         self._in_roleplay_asterisk: bool = False
         self._ai_prefix_printed: bool = False
         self.had_error: bool = False
+        if config is not None and hasattr(config, "verbose"):
+            self.verbose: bool = bool(config.verbose)
+        else:
+            self.verbose: bool = bool(verbose)
+
+    def _format_verbose(self, turn) -> str:
+        stats = getattr(turn, "stats", None)
+        if stats is None and isinstance(turn, dict):
+            stats = turn.get("stats")
+        if not stats:
+            return "(no stats)"
+
+        def _get(key: str, default=None):
+            if isinstance(stats, dict):
+                if key in stats:
+                    return stats[key]
+                ollama = stats.get("ollama")
+                if isinstance(ollama, dict) and key in ollama:
+                    return ollama[key]
+                return default
+            else:
+                if hasattr(stats, key):
+                    return getattr(stats, key)
+                ollama = getattr(stats, "ollama", None)
+                if ollama is not None:
+                    if isinstance(ollama, dict) and key in ollama:
+                        return ollama[key]
+                    if hasattr(ollama, key):
+                        return getattr(ollama, key)
+                return default
+
+        parts = ["verbose"]
+        wall = _get("wall_duration_s")
+        if wall is not None:
+            try:
+                parts.append(f"wall {float(wall):.1f}s")
+            except Exception:
+                pass
+        prompt_count = _get("prompt_eval_count")
+        prompt_dur = _get("prompt_eval_duration")
+        if prompt_count is not None:
+            try:
+                pc = int(prompt_count)
+                if prompt_dur is not None:
+                    pd_s = float(prompt_dur) / 1e9 if float(prompt_dur) > 1e6 else float(prompt_dur)
+                    parts.append(f"prompt {pc} tok ({pd_s:.2f}s)")
+                else:
+                    parts.append(f"prompt {pc} tok")
+            except Exception:
+                pass
+        eval_count = _get("eval_count")
+        eval_dur = _get("eval_duration")
+        if eval_count is not None:
+            try:
+                ec = int(eval_count)
+                if eval_dur is not None:
+                    ed_s = float(eval_dur) / 1e9 if float(eval_dur) > 1e6 else float(eval_dur)
+                    if ed_s > 0:
+                        tok_per_s = ec / ed_s
+                        parts.append(f"eval {ec} tok {tok_per_s:.2f}tok/s")
+                    else:
+                        parts.append(f"eval {ec} tok")
+                else:
+                    parts.append(f"eval {ec} tok")
+            except Exception:
+                pass
+        total_dur = _get("total_duration")
+        if total_dur is not None:
+            try:
+                td = float(total_dur)
+                td_s = td / 1e9 if td > 1e6 else td
+                if td_s >= 1:
+                    parts.append(f"total {td_s:.1f}s")
+                else:
+                    parts.append(f"total {td_s*1000:.1f}ms")
+            except Exception:
+                pass
+        load_dur = _get("load_duration")
+        if load_dur is not None:
+            try:
+                ld = float(load_dur)
+                if ld > 1e6:
+                    parts.append(f"load {ld/1e6:.1f}ms")
+                elif ld > 1e3:
+                    parts.append(f"load {ld:.1f}ms")
+                else:
+                    parts.append(f"load {ld:.2f}s")
+            except Exception:
+                pass
+        if prompt_count is None and eval_count is None:
+            approx = _get("approx_tokens")
+            if approx is None:
+                approx = _get("approx_tokens_before")
+            if approx is None:
+                approx = _get("approx_tokens_after")
+            if approx is not None:
+                try:
+                    parts.append(f"~{int(approx)} tok")
+                except Exception:
+                    pass
+        if len(parts) == 1:
+            return "(no stats)"
+        return " | ".join(parts)
 
     def _write_stdout(self, text: str) -> None:
         if not text:
@@ -313,6 +419,7 @@ class TerminalHooks(Hooks):
             self._below_started = True
             self._below_rows += 1
             self._below_col = 0
+            self._cursor_on_header = False
         self._write_stdout(f"{prefix}{ANSI_THINKING}{text}{ANSI_RESET}")
         self._account_text(text)
 
@@ -324,20 +431,35 @@ class TerminalHooks(Hooks):
         self._spinner_idx += 1
         self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}")
         self._header_active = True
+        self._cursor_on_header = True
 
     def _rewrite_header(self) -> None:
-        """Redraw the Thinking header line in place (spinner advance) via CSI s/u,
-        preserving the streaming cursor exactly. Graceful degradation: when the
-        up-move would meet or exceed the screen height, skip the update rather
-        than corrupting scrollback."""
+        """Redraw the Thinking header line in place (spinner advance), preserving
+        streaming cursor. Uses explicit up/down + column restore instead of CSI
+        s/u (save/restore) for Windows conhost compatibility. Graceful
+        degradation: when up-move would meet or exceed screen height, skip."""
         if self._spinner_frozen or not self._header_active:
             return
-        if self._below_rows >= shutil.get_terminal_size().lines:
+        term_lines = shutil.get_terminal_size().lines
+        # Distance from cursor to the header line.
+        if self._cursor_on_header:
+            dist = 0
+        elif self._below_rows == 0:
+            dist = 1
+        else:
+            dist = self._below_rows
+        if dist >= term_lines:
             return
         frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
-        self._write_stdout(
-            f"\033[s\r\033[{self._below_rows}A\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}\033[u"
-        )
+        if dist == 0:
+            self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}")
+        else:
+            # Up to header, rewrite, down to answer row, restore column.
+            self._write_stdout(
+                f"\033[{dist}A\r\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}\033[{dist}B"
+            )
+            if self._below_col:
+                self._write_stdout(f"\033[{self._below_col}C")
 
     def _collapse_thinking(self, keep_header: bool = True) -> None:
         """Erase the streamed reasoning TEXT rows only.
@@ -371,6 +493,10 @@ class TerminalHooks(Hooks):
         self._below_col = 0
         if not keep_header:
             self._header_active = False
+            self._cursor_on_header = False
+        else:
+            # Cursor now sits one row below the persistent header.
+            self._cursor_on_header = False
         self._last_char_was_newline = True
         self._at_line_start = True
 
@@ -392,6 +518,7 @@ class TerminalHooks(Hooks):
         self._below_started = False
         self._below_rows = 0
         self._below_col = 0
+        self._cursor_on_header = False
         self._spinner_frozen = False
         self._current_tool = None
         self._at_line_start = True
@@ -450,6 +577,13 @@ class TerminalHooks(Hooks):
                 if style:
                     self._write_reasoning(joined)
                 else:
+                    # First answer row below the persistent header must be counted
+                    # (otherwise spinner rewrites with below_rows==0 overwrite the answer).
+                    if self._header_active and not self._below_started:
+                        self._below_started = True
+                        self._below_rows = 1
+                        self._below_col = 0
+                        self._cursor_on_header = False
                     if not self._ai_prefix_printed and not self._in_think and not self._in_bracket:
                         # Print Assistant prefix right where thinking was collapsed or after tool result
                         clean_check = joined.lstrip("\r\n")
@@ -565,6 +699,13 @@ class TerminalHooks(Hooks):
         if not self._last_char_was_newline:
             self._write_stdout("\n")
 
+        if getattr(self, "verbose", False):
+            try:
+                line = self._format_verbose(turn)
+            except Exception:
+                line = "(no stats)"
+            self._write_stdout(f"{ANSI_DIM}⏱ {line}{ANSI_RESET}\n")
+
     def on_tool_start(self, name: str, args: dict) -> None:
         """Clean inline tool execution indication: ⚡ [tool_name] args_summary."""
         summary = _format_args_summary(name, args)
@@ -635,6 +776,7 @@ def _get_help_text() -> str:
         f"    {ANSI_CYAN}/cls{ANSI_RESET}             Clear terminal screen view only\n"
         f"    {ANSI_CYAN}/model [name]{ANSI_RESET}    View active model or switch to another Ollama model on the fly\n"
         f"    {ANSI_CYAN}/status{ANSI_RESET}          Show current workspace, model, base URL, and permissions\n"
+        f"    {ANSI_CYAN}/verbose [on|off]{ANSI_RESET} Toggle verbose stats display (on/off/status)\n"
         f"    {ANSI_CYAN}/exit, /quit{ANSI_RESET}     Exit assistant\n"
         f"\n"
         f"  {ANSI_BOLD}KEYBOARD SHORTCUTS:{ANSI_RESET}\n"
@@ -654,6 +796,7 @@ def _get_help_text() -> str:
         f"  {ANSI_BOLD}PERMISSIONS & CONFIGURATION:{ANSI_RESET}\n"
         f"    Configuration file: ~/.opencode-lite/config.toml\n"
         f"    Tool permissions can be set to: 'allow' | 'ask' | 'deny'\n"
+        f"    Verbose stats use Ollama built-in when available (otherwise local estimate)\n"
         f"{ANSI_BOLD}=================================================================================={ANSI_RESET}\n"
     )
 
@@ -698,7 +841,7 @@ def run_repl(
     _print(f"{ANSI_DIM}assistant {VERSION} | model: {model} | workspace: {workspace}{ANSI_RESET}")
     _print(f"{ANSI_DIM}Type /help for commands, /exit to quit.{ANSI_RESET}\n")
 
-    hooks = TerminalHooks(input_fn=_read_input)
+    hooks = TerminalHooks(input_fn=_read_input, config=config, verbose=bool(getattr(config, "verbose", False)) if config is not None else False)
     if hasattr(agent, "hooks"):
         agent.hooks = hooks
 
@@ -771,6 +914,29 @@ def run_repl(
                 if perm_str:
                     _print(f"Permissions: {perm_str}")
                 _print()
+                continue
+            elif cmd == "/verbose":
+                cur = bool(getattr(hooks, "verbose", False) if hasattr(hooks, "verbose") else getattr(config, "verbose", False) if config is not None and hasattr(config, "verbose") else False)
+                if not arg:
+                    new_val = not cur
+                    if config is not None and hasattr(config, "verbose"):
+                        config.verbose = new_val
+                    hooks.verbose = new_val
+                    _print(f"{ANSI_DIM}Verbose: {'on' if new_val else 'off'}{ANSI_RESET}")
+                elif arg.lower() in ("on", "true", "1", "yes", "enable"):
+                    if config is not None and hasattr(config, "verbose"):
+                        config.verbose = True
+                    hooks.verbose = True
+                    _print(f"{ANSI_DIM}Verbose: on{ANSI_RESET}")
+                elif arg.lower() in ("off", "false", "0", "no", "disable"):
+                    if config is not None and hasattr(config, "verbose"):
+                        config.verbose = False
+                    hooks.verbose = False
+                    _print(f"{ANSI_DIM}Verbose: off{ANSI_RESET}")
+                elif arg.lower() in ("status", "show"):
+                    _print(f"{ANSI_DIM}Verbose: {'on' if cur else 'off'}{ANSI_RESET}")
+                else:
+                    _print(f"{ANSI_RED}Usage: /verbose [on|off|status]{ANSI_RESET}")
                 continue
             else:
                 _print(f"{ANSI_RED}Unknown command '{cmd}'. Type /help for available commands.{ANSI_RESET}\n")
