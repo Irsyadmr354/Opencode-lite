@@ -424,10 +424,10 @@ def test_prompt_prefix_styled_bold_cyan(tmp_path):
     )
 
     assert len(prompts_received) == 1
-    assert prompts_received[0] == "\033[1;36m[YOU]:\033[0m "
-    assert ui_mod.PROMPT_PREFIX == "\033[1;36m[YOU]:\033[0m "
-    assert "[AI]:" in ui_mod.AI_PREFIX
-    assert "[Thoughts]:" in ui_mod.THOUGHTS_PREFIX
+    assert prompts_received[0] == "\033[1;36m⬢ You:\033[0m "
+    assert ui_mod.PROMPT_PREFIX == "\033[1;36m⬢ You:\033[0m "
+    assert "⬡ Assistant:" in ui_mod.AI_PREFIX
+    assert "⠋ Thinking:" in ui_mod.THOUGHTS_PREFIX
 
 
 def test_strip_roleplay_asterisks_streaming_and_helper():
