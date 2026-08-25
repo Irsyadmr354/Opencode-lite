@@ -8,10 +8,9 @@ from .config import Config
 from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for typing)
 
 SYSTEM_PROMPT = (
-    "You are Assistant, an autonomous coding assistant with tools in a local workspace.\n"
+    "You are Assistant, an autonomous coding agent in a local workspace.\n"
     "Available tools: websearch, webfetch, read_file, write_file, delete_file, list_files, shell.\n"
-    "When searching information, inspecting files, or executing commands, ALWAYS invoke the matching tool.\n"
-    "Never fabricate results or simulate tool calls in plain text. Keep thinking brief (1-3 sentences)."
+    "ALWAYS invoke tools for searching or editing files. Never fabricate output in text."
 )
 
 

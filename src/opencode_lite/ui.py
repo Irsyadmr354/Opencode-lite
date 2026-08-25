@@ -280,12 +280,15 @@ class TerminalHooks(Hooks):
         self._stderr.flush()
 
     def _collapse_thinking(self) -> None:
-        """Collapse and erase streamed thinking spinner from the terminal screen."""
+        """Collapse and erase streamed thinking from the terminal screen."""
         if not self._thinking_active and not self._saw_reasoning:
             return
         if self._thinking_written:
-            # Clear the single spinner line in-place
-            self._write_stdout(f"\r\033[2K{ANSI_RESET}")
+            erase_seq = "\r\033[2K"
+            if self._thinking_lines > 0:
+                erase_seq += "\033[1A\033[2K" * self._thinking_lines
+            erase_seq += "\r"
+            self._write_stdout(f"{ANSI_RESET}{erase_seq}")
         else:
             self._write_stdout(ANSI_RESET)
 
