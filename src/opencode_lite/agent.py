@@ -29,6 +29,8 @@ _PERMISSION_KEY = {
 class Hooks:
     """No-op lifecycle hooks; the UI subclasses this."""
 
+    def on_start(self) -> None: ...
+
     def on_delta(self, text: str) -> None: ...
 
     def on_reasoning(self, text: str) -> None: ...
@@ -197,6 +199,11 @@ class Agent:
         self._prune_context()
         self.messages.append({"role": "user", "content": user_text})
         self.cancelled = False
+        # Immediate feedback: show spinner before any network wait (TTFT)
+        try:
+            self.hooks.on_start()
+        except Exception:
+            pass
         flag = _CancelFlag(self)
         max_rounds = max(1, int(self.config.max_tool_rounds))
 

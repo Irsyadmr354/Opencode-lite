@@ -148,6 +148,10 @@ def build_console_hooks(hooks_base: type) -> type:
                 return "(no stats)"
             return " | ".join(parts)
 
+        def on_start(self) -> None:
+            # Immediate TTFT feedback for headless mode
+            print("… thinking…", file=sys.stderr, flush=True)
+
         def on_delta(self, text: str) -> None:
             sys.stdout.write(text)
             sys.stdout.flush()

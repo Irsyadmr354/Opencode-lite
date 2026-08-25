@@ -8,6 +8,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -22,6 +23,7 @@ try:
     from opencode_lite.agent import Hooks
 except ImportError:
     class Hooks:  # type: ignore[no-redef]
+        def on_start(self) -> None: ...
         def on_delta(self, text: str) -> None: ...
         def on_reasoning(self, text: str) -> None: ...
         def on_assistant_done(self, turn: Any) -> None: ...
@@ -274,6 +276,9 @@ class TerminalHooks(Hooks):
         self._in_roleplay_asterisk: bool = False
         self._ai_prefix_printed: bool = False
         self.had_error: bool = False
+        self._pending_thread: threading.Thread | None = None
+        self._pending_stop = threading.Event()
+        self._pending_lock = threading.Lock()
         if config is not None and hasattr(config, "verbose"):
             self.verbose: bool = bool(config.verbose)
         else:
@@ -435,7 +440,42 @@ class TerminalHooks(Hooks):
         self._last_char_was_newline = True
         self._at_line_start = True
 
+    def _stop_pending(self) -> None:
+        try:
+            self._pending_stop.set()
+            thr = self._pending_thread
+            if thr is not None and thr.is_alive():
+                thr.join(timeout=0.3)
+        except Exception:
+            pass
+        self._pending_thread = None
+
+    def _pending_loop(self) -> None:
+        # Animates the single-line header while waiting for first token (TTFT)
+        while not self._pending_stop.is_set():
+            time.sleep(0.08)
+            if self._pending_stop.is_set():
+                break
+            with self._pending_lock:
+                if self._header_active and not self._spinner_frozen:
+                    self._update_header()
+
+    def on_start(self) -> None:
+        # Immediate feedback: show spinner instantly, animate in background
+        if self._header_active:
+            return
+        self._saw_reasoning = True
+        self._thinking_active = True
+        self._begin_header()
+        try:
+            self._pending_stop.clear()
+            self._pending_thread = threading.Thread(target=self._pending_loop, daemon=True)
+            self._pending_thread.start()
+        except Exception:
+            pass
+
     def reset_stream(self) -> None:
+        self._stop_pending()
         if self._header_active and not self._spinner_frozen:
             self._collapse_thinking(keep_header=False)
         elif self._header_active and self._spinner_frozen:
@@ -456,6 +496,7 @@ class TerminalHooks(Hooks):
     def on_reasoning(self, text: str) -> None:
         if not text:
             return
+        self._stop_pending()
         self._saw_reasoning = True
         self._thinking_active = True
         if not self._header_active:
@@ -470,6 +511,9 @@ class TerminalHooks(Hooks):
     def on_delta(self, text: str) -> None:
         if not text:
             return
+        # First real token ends the pending TTFT animation
+        if self._pending_thread is not None:
+            self._stop_pending()
         if self._saw_reasoning or (self._thinking_active and not self._in_think and not self._in_bracket):
             self._collapse_thinking(keep_header=True)
 
@@ -576,6 +620,7 @@ class TerminalHooks(Hooks):
                 flush_cur()
 
     def on_assistant_done(self, turn: Any) -> None:
+        self._stop_pending()
         if self._buffer:
             buf = self._buffer
             self._buffer = ""
@@ -649,6 +694,7 @@ class TerminalHooks(Hooks):
 
     def on_error(self, msg: str) -> None:
         """Error messages formatted in red."""
+        self._stop_pending()
         self.had_error = True
         self._write_stderr(f"{ANSI_BOLD_RED}ERROR:{ANSI_RESET} {ANSI_RED}{msg}{ANSI_RESET}\n")
 
