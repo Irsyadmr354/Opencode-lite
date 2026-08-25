@@ -1,10 +1,13 @@
-"""Ultra-minimal terminal interface for opencode-lite (pure, transparent CLI feel)."""
+"""Pure Native Terminal REPL and UI for opencode-lite."""
 
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable, TextIO
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -16,7 +19,7 @@ from textual.widgets import Button, Input, RichLog, Static
 try:
     from opencode_lite.agent import Hooks
 except ImportError:
-    class Hooks:
+    class Hooks:  # type: ignore[no-redef]
         def on_delta(self, text: str) -> None: ...
         def on_reasoning(self, text: str) -> None: ...
         def on_assistant_done(self, turn: Any) -> None: ...
@@ -32,11 +35,66 @@ VERSION = "0.1.0"
 RESULT_PREVIEW_CHARS = 300
 ARGS_PREVIEW_LINES = 30
 
-
 THINKING_STYLE = "italic dim cyan"
 MAX_LINE_CHARS = 80
 _TAG_OPENERS = ("<think>", "[thinking:")
 _TAG_CLOSER_THINK = "</think>"
+
+# ANSI Color and Style Codes
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
+ANSI_ITALIC = "\033[3m"
+ANSI_RED = "\033[31m"
+ANSI_BOLD_RED = "\033[1;31m"
+ANSI_GREEN = "\033[32m"
+ANSI_DIM_GREEN = "\033[2;32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_BOLD_YELLOW = "\033[1;33m"
+ANSI_CYAN = "\033[36m"
+ANSI_DIM_CYAN = "\033[2;36m"
+ANSI_THINKING = "\033[3;2;36m"  # italic dim cyan
+
+
+def _compact_json(args: Any) -> str:
+    try:
+        return json.dumps(args, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        return str(args)
+
+
+def _format_args_summary(name: str, args: dict | Any) -> str:
+    if not isinstance(args, dict):
+        return str(args)
+    if name == "shell" and "command" in args:
+        return str(args["command"])
+    if name in ("read_file", "delete_file") and "path" in args:
+        start = args.get("start_line")
+        if start:
+            return f"{args['path']}:{start}"
+        return str(args["path"])
+    if name == "write_file" and "path" in args:
+        return str(args["path"])
+    if name == "list_files":
+        path = args.get("path", ".")
+        pattern = args.get("pattern")
+        return f"{path} [{pattern}]" if pattern else str(path)
+    if name == "webfetch" and "url" in args:
+        return str(args["url"])
+    if name == "websearch" and "query" in args:
+        return str(args["query"])
+    return _compact_json(args)
+
+
+def _pretty_json(args: Any, max_lines: int = ARGS_PREVIEW_LINES) -> str:
+    try:
+        rendered = json.dumps(args, indent=2, default=str)
+    except (TypeError, ValueError):
+        rendered = str(args)
+    lines = rendered.splitlines() or ["{}"]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"... (+{len(lines) - max_lines} more lines)"]
+    return "\n".join(lines)
 
 
 def _tag_holdback(buffer: str, in_think: bool) -> int:
@@ -115,26 +173,383 @@ def _parse_thinking_text(text: str, state: dict[str, bool]) -> Text:
     return res
 
 
-def _compact_json(args: Any) -> str:
-    try:
-        return json.dumps(args, separators=(",", ":"), default=str)
-    except (TypeError, ValueError):
-        return str(args)
+class TerminalHooks(Hooks):
+    """Pure native terminal hooks for real-time word-by-word streaming, ANSI colors,
+    clean inline tool execution, inline permission prompts, and red error messages."""
+
+    def __init__(
+        self,
+        stdout: TextIO | None = None,
+        stderr: TextIO | None = None,
+        input_fn: Callable[[str], str] | None = None,
+    ) -> None:
+        super().__init__()
+        self._stdout: TextIO = stdout if stdout is not None else sys.stdout
+        self._stderr: TextIO = stderr if stderr is not None else sys.stderr
+        self._input_fn: Callable[[str], str] = input_fn if input_fn is not None else input
+        self._in_think: bool = False
+        self._in_bracket: bool = False
+        self._buffer: str = ""
+        self._saw_reasoning: bool = False
+        self._current_tool: tuple[str, str] | None = None
+        self._last_char_was_newline: bool = True
+        self.had_error: bool = False
+
+    def _write_stdout(self, text: str) -> None:
+        if not text:
+            return
+        self._stdout.write(text)
+        self._stdout.flush()
+        self._last_char_was_newline = text.endswith("\n")
+
+    def _write_stderr(self, text: str) -> None:
+        if not text:
+            return
+        self._stderr.write(text)
+        self._stderr.flush()
+
+    def reset_stream(self) -> None:
+        """Reset internal streaming state cleanly."""
+        if self._in_think or self._in_bracket or self._saw_reasoning:
+            self._write_stdout(ANSI_RESET)
+        self._in_think = False
+        self._in_bracket = False
+        self._buffer = ""
+        self._saw_reasoning = False
+        self._current_tool = None
+
+    def on_reasoning(self, text: str) -> None:
+        """Real-time streaming for dedicated reasoning/reasoning_content field in italic dim cyan."""
+        if not text:
+            return
+        if not self._saw_reasoning:
+            self._saw_reasoning = True
+            self._write_stdout(ANSI_THINKING)
+        self._write_stdout(text)
+
+    def on_delta(self, text: str) -> None:
+        """Real-time word-by-word streaming directly to stdout, parsing <think>...</think> in italic dim cyan."""
+        if not text:
+            return
+        if self._saw_reasoning:
+            self._write_stdout(ANSI_RESET)
+            if not self._last_char_was_newline:
+                self._write_stdout("\n")
+            self._saw_reasoning = False
+
+        self._buffer += text
+        hold = _tag_holdback(self._buffer, self._in_think)
+        if hold > 0:
+            to_process = self._buffer[:-hold]
+            self._buffer = self._buffer[-hold:]
+        else:
+            to_process = self._buffer
+            self._buffer = ""
+
+        if not to_process:
+            return
+
+        self._render_chunk(to_process)
+
+    def _render_chunk(self, chunk: str) -> None:
+        i = 0
+        n = len(chunk)
+        cur: list[str] = []
+
+        def flush_cur(style: str | None = None) -> None:
+            if cur:
+                joined = "".join(cur)
+                if style:
+                    self._write_stdout(f"{style}{joined}{ANSI_RESET}")
+                else:
+                    self._write_stdout(joined)
+                cur.clear()
+
+        while i < n:
+            if not self._in_think and not self._in_bracket:
+                lower = chunk[i:].lower()
+                if lower.startswith("<think>"):
+                    flush_cur()
+                    self._in_think = True
+                    self._write_stdout(ANSI_THINKING)
+                    i += 7
+                elif lower.startswith("[thinking:"):
+                    flush_cur()
+                    self._in_bracket = True
+                    self._write_stdout(ANSI_THINKING)
+                    i += 10
+                else:
+                    cur.append(chunk[i])
+                    i += 1
+            elif self._in_think:
+                lower = chunk[i:].lower()
+                if lower.startswith("</think>"):
+                    flush_cur(ANSI_THINKING)
+                    self._in_think = False
+                    self._write_stdout(ANSI_RESET)
+                    i += 8
+                else:
+                    cur.append(chunk[i])
+                    i += 1
+            elif self._in_bracket:
+                if chunk[i] == "]":
+                    flush_cur(ANSI_THINKING)
+                    self._in_bracket = False
+                    self._write_stdout(ANSI_RESET)
+                    i += 1
+                else:
+                    cur.append(chunk[i])
+                    i += 1
+
+        if cur:
+            if self._in_think or self._in_bracket:
+                flush_cur(ANSI_THINKING)
+            else:
+                flush_cur()
+
+    def on_assistant_done(self, turn: Any) -> None:
+        """Called when the assistant turn completes. Flush buffers, reset styles, ensure newline."""
+        if self._buffer:
+            buf = self._buffer
+            self._buffer = ""
+            self._render_chunk(buf)
+
+        if self._in_think or self._in_bracket or self._saw_reasoning:
+            self._write_stdout(ANSI_RESET)
+            self._in_think = False
+            self._in_bracket = False
+            self._saw_reasoning = False
+
+        if not self._last_char_was_newline:
+            self._write_stdout("\n")
+
+    def on_tool_start(self, name: str, args: dict) -> None:
+        """Clean inline tool execution indication: ⚡ [tool_name] args_summary."""
+        summary = _format_args_summary(name, args)
+        self._current_tool = (name, summary)
+        if not self._last_char_was_newline:
+            self._write_stdout("\n")
+        self._write_stdout(f"{ANSI_YELLOW}⚡{ANSI_RESET} {ANSI_BOLD}[{name}]{ANSI_RESET} {summary}")
+
+    def on_tool_result(self, name: str, res: Any) -> None:
+        """Clean inline tool result: -> ok / -> ERROR: <msg>."""
+        ok = bool(getattr(res, "ok", True) if not isinstance(res, dict) else res.get("ok", True))
+        out = str(getattr(res, "output", "") if not isinstance(res, dict) else res.get("output", ""))
+        out_clean = " ".join(out.split())
+        preview = f"{out_clean[:RESULT_PREVIEW_CHARS]}{'...' if len(out_clean) > RESULT_PREVIEW_CHARS else ''}"
+
+        if self._current_tool is None:
+            summary = _format_args_summary(name, {})
+            if not self._last_char_was_newline:
+                self._write_stdout("\n")
+            self._write_stdout(f"{ANSI_YELLOW}⚡{ANSI_RESET} {ANSI_BOLD}[{name}]{ANSI_RESET} {summary}")
+
+        if ok:
+            if preview and preview != "ok" and len(preview) <= 60:
+                self._write_stdout(f" -> {ANSI_GREEN}ok{ANSI_RESET} ({preview})\n")
+            else:
+                self._write_stdout(f" -> {ANSI_GREEN}ok{ANSI_RESET}\n")
+        else:
+            if preview.startswith("ERROR:"):
+                preview = preview[6:].strip()
+            err_text = preview or "failed"
+            self._write_stdout(f" -> {ANSI_RED}ERROR: {err_text}{ANSI_RESET}\n")
+
+        self._current_tool = None
+
+    def on_permission(self, name: str, args: dict) -> bool:
+        """Inline permission prompt: [permission] Allow <tool_name>(<args_summary>)? [y/N]: """
+        summary = _format_args_summary(name, args)
+        if not self._last_char_was_newline:
+            self._write_stdout("\n")
+        prompt = f"{ANSI_BOLD_YELLOW}[permission]{ANSI_RESET} Allow {name}({summary})? [y/N]: "
+        try:
+            answer = self._input_fn(prompt).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            self._write_stdout("\n")
+            return False
+        return answer in ("y", "yes")
+
+    def on_status(self, info: dict) -> None:
+        pass
+
+    def on_error(self, msg: str) -> None:
+        """Error messages formatted in red."""
+        self.had_error = True
+        self._write_stderr(f"{ANSI_BOLD_RED}ERROR:{ANSI_RESET} {ANSI_RED}{msg}{ANSI_RESET}\n")
 
 
-def _pretty_json(args: Any, max_lines: int = ARGS_PREVIEW_LINES) -> str:
-    try:
-        rendered = json.dumps(args, indent=2, default=str)
-    except (TypeError, ValueError):
-        rendered = str(args)
-    lines = rendered.splitlines() or ["{}"]
-    if len(lines) > max_lines:
-        lines = lines[:max_lines] + [f"... (+{len(lines) - max_lines} more lines)"]
-    return "\n".join(lines)
+UiHooks = TerminalHooks
 
+
+def _get_help_text() -> str:
+    return (
+        f"\n"
+        f"{ANSI_BOLD}============================== OPENCODE-LITE GUIDE =============================={ANSI_RESET}\n"
+        f"\n"
+        f"  {ANSI_BOLD}COMMANDS:{ANSI_RESET}\n"
+        f"    {ANSI_CYAN}/help{ANSI_RESET}            Display this comprehensive reference guide\n"
+        f"    {ANSI_CYAN}/clear{ANSI_RESET}           Clear terminal screen\n"
+        f"    {ANSI_CYAN}/reset{ANSI_RESET}           Reset conversation memory & start fresh session\n"
+        f"    {ANSI_CYAN}/model [name]{ANSI_RESET}    View active model or switch to another Ollama model on the fly\n"
+        f"    {ANSI_CYAN}/status{ANSI_RESET}          Show current workspace, model, base URL, and permissions\n"
+        f"    {ANSI_CYAN}/exit, /quit{ANSI_RESET}     Exit opencode-lite\n"
+        f"\n"
+        f"  {ANSI_BOLD}KEYBOARD SHORTCUTS:{ANSI_RESET}\n"
+        f"    {ANSI_BOLD}Enter{ANSI_RESET}            Send prompt to the agent\n"
+        f"    {ANSI_BOLD}Ctrl+C{ANSI_RESET}           Cancel active streaming generation / reset prompt\n"
+        f"    {ANSI_BOLD}Ctrl+D / Ctrl+Z{ANSI_RESET}  Exit opencode-lite (EOF)\n"
+        f"\n"
+        f"  {ANSI_BOLD}BUILT-IN TOOLS (AUTONOMOUS):{ANSI_RESET}\n"
+        f"    * {ANSI_BOLD}read_file(path, start_line){ANSI_RESET}   Read files in workspace with line numbers\n"
+        f"    * {ANSI_BOLD}write_file(path, content){ANSI_RESET}     Create or update files in workspace\n"
+        f"    * {ANSI_BOLD}delete_file(path){ANSI_RESET}             Permanently delete a file (gated by confirmation)\n"
+        f"    * {ANSI_BOLD}list_files(path, pattern){ANSI_RESET}     List workspace directory entries via glob\n"
+        f"    * {ANSI_BOLD}shell(command){ANSI_RESET}                Execute shell commands (gated by confirmation)\n"
+        f"    * {ANSI_BOLD}webfetch(url){ANSI_RESET}                 Fetch webpage text content directly\n"
+        f"    * {ANSI_BOLD}websearch(query){ANSI_RESET}              Search the web via DuckDuckGo\n"
+        f"\n"
+        f"  {ANSI_BOLD}PERMISSIONS & CONFIGURATION:{ANSI_RESET}\n"
+        f"    Configuration file: ~/.opencode-lite/config.toml\n"
+        f"    Tool permissions can be set to: 'allow' | 'ask' | 'deny'\n"
+        f"{ANSI_BOLD}=================================================================================={ANSI_RESET}\n"
+    )
+
+
+def run_repl(
+    agent: Any,
+    config: Any = None,
+    input_fn: Callable[[str], str] | None = None,
+    output_fn: Callable[[str], None] | None = None,
+    clear_fn: Callable[[], None] | None = None,
+) -> None:
+    """Run the pure native terminal REPL loop."""
+    if config is None:
+        config = getattr(agent, "config", None)
+
+    # Enable ANSI escape sequences on Windows if possible
+    if os.name == "nt":
+        os.system("")
+
+    def _clear_screen() -> None:
+        if clear_fn is not None:
+            clear_fn()
+        else:
+            os.system("cls" if os.name == "nt" else "clear")
+
+    def _print(msg: str = "") -> None:
+        if output_fn is not None:
+            output_fn(msg)
+        else:
+            print(msg)
+
+    _read_input = input_fn if input_fn is not None else input
+
+    # Clear terminal screen on launch
+    _clear_screen()
+
+    model = getattr(config, "model", getattr(getattr(agent, "client", None), "model", "default"))
+    workspace = getattr(config, "workspace", Path.cwd())
+
+    # Minimal banner
+    _print(f"opencode-lite {VERSION} | model: {model} | workspace: {workspace}")
+    _print("Type /help for commands, /exit to quit.\n")
+
+    hooks = TerminalHooks(input_fn=_read_input)
+    if hasattr(agent, "hooks"):
+        agent.hooks = hooks
+
+    last_was_sigint = False
+
+    while True:
+        try:
+            user_input = _read_input("> ").strip()
+            last_was_sigint = False
+        except KeyboardInterrupt:
+            if last_was_sigint:
+                _print("\nGoodbye!")
+                break
+            last_was_sigint = True
+            _print("\nType /exit or press Ctrl+C again to quit.")
+            continue
+        except EOFError:
+            _print("\nGoodbye!")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.startswith("/"):
+            parts = user_input.split(maxsplit=1)
+            cmd = parts[0].lower()
+            arg = parts[1].strip() if len(parts) > 1 else ""
+
+            if cmd in ("/exit", "/quit", "/q"):
+                _print("Goodbye!")
+                break
+            elif cmd in ("/help", "/?", "/h"):
+                _print(_get_help_text())
+                continue
+            elif cmd in ("/clear", "/cls"):
+                _clear_screen()
+                continue
+            elif cmd in ("/reset", "/restart"):
+                if hasattr(agent, "reset"):
+                    agent.reset()
+                elif hasattr(agent, "messages"):
+                    agent.messages.clear()
+                _print("Session memory reset.\n")
+                continue
+            elif cmd == "/model":
+                if arg:
+                    if config is not None and hasattr(config, "model"):
+                        config.model = arg
+                    if hasattr(agent, "client") and hasattr(agent.client, "model"):
+                        agent.client.model = arg
+                    _print(f"Model switched to: {arg}\n")
+                else:
+                    cur_model = getattr(config, "model", getattr(getattr(agent, "client", None), "model", "?"))
+                    _print(f"Active model: {cur_model}\n")
+                continue
+            elif cmd == "/status":
+                ws = getattr(config, "workspace", getattr(agent, "config", None) and getattr(agent.config, "workspace", "."))
+                mdl = getattr(config, "model", getattr(getattr(agent, "client", None), "model", "?"))
+                url = getattr(config, "base_url", "http://127.0.0.1:11434/v1")
+                perms = getattr(config, "permissions", None)
+                perm_str = ""
+                if perms:
+                    if hasattr(perms, "__dict__"):
+                        perm_str = ", ".join(f"{k}={v}" for k, v in perms.__dict__.items() if not k.startswith("_"))
+                    elif isinstance(perms, dict):
+                        perm_str = ", ".join(f"{k}={v}" for k, v in perms.items())
+                _print(f"Workspace:   {ws}")
+                _print(f"Model:       {mdl}")
+                _print(f"Base URL:    {url}")
+                if perm_str:
+                    _print(f"Permissions: {perm_str}")
+                _print()
+                continue
+            else:
+                _print(f"Unknown command '{cmd}'. Type /help for available commands.\n")
+                continue
+
+        # Normal prompt submission to agent
+        try:
+            agent.submit(user_input)
+        except KeyboardInterrupt:
+            agent.cancelled = True
+            hooks.reset_stream()
+            _print("\n[Cancelled]\n")
+            if hasattr(agent, "messages") and agent.messages and agent.messages[-1].get("role") == "user":
+                agent.messages.pop()
+        except Exception as exc:
+            hooks.on_error(f"{type(exc).__name__}: {exc}")
+
+
+# --- Legacy Compatibility Classes (Textual TUI) ------------------------------
 
 class PermissionModal(ModalScreen[bool]):
-    """Minimal confirmation modal for dangerous tool operations."""
+    """Compatibility modal screen for Textual."""
 
     BINDINGS = [
         Binding("y", "allow", "Allow"),
@@ -203,350 +618,15 @@ class PermissionModal(ModalScreen[bool]):
 
 
 class ChatApp(App[None]):
-    """Pure minimal, raw CLI-feeling interface with comprehensive /help."""
+    """Compatibility Textual App export."""
 
     TITLE = "opencode-lite"
-
-    CSS = """
-    Screen {
-        background: transparent;
-        color: $text;
-        layout: vertical;
-    }
-    #chat {
-        height: 1fr;
-        padding: 0 1;
-        background: transparent;
-        border: none;
-        scrollbar-size: 0 0;
-    }
-    #active-stream {
-        height: auto;
-        max-height: 15;
-        padding: 0 1;
-        background: transparent;
-    }
-    #status {
-        height: 1;
-        padding: 0 1;
-        color: $text-muted;
-        background: transparent;
-    }
-    #input {
-        background: transparent;
-        color: $text;
-        border: none;
-        border-top: solid $surface-lighten-1;
-        padding: 0 1;
-    }
-    #input:focus {
-        border: none;
-        border-top: solid $accent;
-    }
-    """
-
-    BINDINGS = [
-        Binding("ctrl+c", "cancel_or_quit", "Cancel/Quit", priority=True),
-        Binding("escape", "cancel_generation", "Cancel", show=False),
-        Binding("ctrl+l", "clear_log", "Clear"),
-        Binding("ctrl+r", "reset_agent", "Reset"),
-        Binding("ctrl+q", "quit", "Quit"),
-    ]
 
     def __init__(self, agent: Any, config: Any) -> None:
         super().__init__()
         self.agent = agent
         self.config = config
         self._busy = False
-        outer = self
-
-        class UiHooks(Hooks):
-            def __init__(self) -> None:
-                super().__init__()
-                self._current_delta_parts: list[str] = []
-                self._reason_parts: list[str] = []
-                self._saw_reasoning: bool = False
-                self._think_state: dict[str, bool] = {"in_think": False, "in_bracket": False}
-
-            def _render_active(self) -> Text:
-                res = Text()
-                if self._reason_parts:
-                    res.append("".join(self._reason_parts), style=THINKING_STYLE)
-                    if self._current_delta_parts:
-                        res.append("\n")
-                if self._current_delta_parts:
-                    content_so_far = "".join(self._current_delta_parts)
-                    res.append(_parse_thinking_text(content_so_far, {"in_think": False, "in_bracket": False}))
-                return res
-
-            def on_reasoning(self, text: str) -> None:
-                """Reasoning from the dedicated reasoning/reasoning_content field."""
-                self._saw_reasoning = True
-                self._reason_parts.append(text)
-                rendered = self._render_active()
-                outer._ui(lambda r=rendered: outer._active_stream().update(r))
-
-            def on_delta(self, text: str) -> None:
-                self._current_delta_parts.append(text)
-                rendered = self._render_active()
-                outer._ui(lambda r=rendered: outer._active_stream().update(r))
-
-            def on_assistant_done(self, turn: Any) -> None:
-                # 1. Clear active stream widget
-                outer._ui(lambda: outer._active_stream().update(""))
-
-                # 2. Streamed or fallback reasoning (dedicated field)
-                reasoning_str = "".join(self._reason_parts)
-                if not reasoning_str and getattr(turn, "reasoning", None):
-                    reasoning_str = str(turn.reasoning)
-
-                if reasoning_str:
-                    for line in reasoning_str.split("\n"):
-                        outer._ui(lambda l=line: outer._chat().write(Text(l, style=THINKING_STYLE)))
-
-                # 3. Streamed or fallback content
-                content_str = "".join(self._current_delta_parts)
-                if not content_str and getattr(turn, "content", None):
-                    content_str = str(turn.content)
-
-                if content_str:
-                    rendered = _parse_thinking_text(content_str, {"in_think": False, "in_bracket": False})
-                    outer._ui(lambda r=rendered: outer._chat().write(r))
-
-                if reasoning_str or content_str:
-                    outer._ui(lambda: outer._chat().write(Text("")))
-
-                self._current_delta_parts.clear()
-                self._reason_parts.clear()
-                self._think_state = {"in_think": False, "in_bracket": False}
-                self._saw_reasoning = False
-
-            def on_tool_start(self, name: str, args: dict) -> None:
-                line = Text(f">> {name} {_compact_json(args)}", style="dim cyan")
-                outer._ui(lambda: outer._chat().write(line))
-
-            def on_tool_result(self, name: str, res: Any) -> None:
-                ok = bool(getattr(res, "ok", True))
-                out = " ".join(str(getattr(res, "output", "")).split())
-                preview = f"{out[:RESULT_PREVIEW_CHARS]}{'...' if len(out) > RESULT_PREVIEW_CHARS else ''}"
-                prefix = "" if ok else "ERROR: "
-                line = Text(
-                    f"<- {name}: {prefix}{preview}",
-                    style="red" if not ok else "dim green",
-                )
-                outer._ui(lambda: outer._chat().write(line))
-
-            def on_status(self, info: dict) -> None:
-                model = getattr(outer.config, "model", "?")
-                round_no = info.get("round", "?")
-                max_rounds = info.get("max", "?")
-                approx_tokens = info.get("approx_tokens", "?")
-                outer._ui(
-                    lambda: outer._set_status(
-                        f"{model} | round {round_no}/{max_rounds} | ~{approx_tokens} tok"
-                    )
-                )
-
-            def on_error(self, msg: str) -> None:
-                outer._ui(lambda: outer._chat().write(Text(f"ERROR: {msg}", style="bold red")))
-
-            def on_permission(self, name: str, args: dict) -> bool:
-                done = threading.Event()
-                box: dict[str, bool] = {"allow": False}
-
-                def push_modal() -> None:
-                    def cb(allowed: bool | None) -> None:
-                        box["allow"] = bool(allowed)
-                        done.set()
-
-                    outer.push_screen(PermissionModal(name, args), cb)
-
-                try:
-                    outer.call_from_thread(push_modal)
-                except Exception:
-                    return False
-                done.wait()
-                return box["allow"]
-
-        self.UiHooks = UiHooks
-        self.hooks: Hooks = UiHooks()
+        self.hooks = TerminalHooks()
         if hasattr(agent, "hooks"):
-            try:
-                agent.hooks = self.hooks
-            except Exception:
-                pass
-
-    def compose(self) -> ComposeResult:
-        yield RichLog(id="chat", markup=False, highlight=False, wrap=True)
-        yield Static("", id="active-stream")
-        yield Static("", id="status")
-        yield Input(placeholder="> Type a prompt or /help...", id="input")
-
-    def on_mount(self) -> None:
-        model = getattr(self.config, "model", "?")
-        workspace = getattr(self.config, "workspace", "?")
-        log = self._chat()
-        log.write(Text(f"opencode-lite {VERSION} | model: {model} | workspace: {workspace}", style="dim"))
-        log.write(Text("Type /help for full guide and commands.\n", style="dim"))
-        self._set_status(f"{model} | idle")
-        self.query_one("#input", Input).focus()
-
-    def _chat(self) -> RichLog:
-        return self.query_one("#chat", RichLog)
-
-    def _active_stream(self) -> Static:
-        return self.query_one("#active-stream", Static)
-
-    def _status(self) -> Static:
-        return self.query_one("#status", Static)
-
-    def _input(self) -> Input:
-        return self.query_one("#input", Input)
-
-    def _set_status(self, text: str) -> None:
-        self._status().update(text)
-
-    def _model_label(self) -> str:
-        return str(getattr(self.config, "model", "?"))
-
-    def _ui(self, fn: Any) -> None:
-        try:
-            self.call_from_thread(fn)
-        except Exception:
-            pass
-
-    def action_cancel_or_quit(self) -> None:
-        if not self._cancel_generation():
-            self.exit()
-
-    def action_cancel_generation(self) -> None:
-        self._cancel_generation()
-
-    def action_clear_log(self) -> None:
-        self._chat().clear()
-        self._active_stream().update("")
-
-    def action_reset_agent(self) -> None:
-        if hasattr(self.agent, "reset"):
-            self.agent.reset()
-        elif hasattr(self.agent, "messages"):
-            self.agent.messages.clear()
-        self._chat().write(Text("Session memory reset.\n", style="dim cyan"))
-
-    def action_show_help(self) -> None:
-        help_guide = (
-            "\n"
-            "============================== OPENCODE-LITE GUIDE ==============================\n"
-            "\n"
-            "  COMMANDS:\n"
-            "    /help            Display this comprehensive reference guide\n"
-            "    /clear           Clear current chat viewport history\n"
-            "    /reset           Reset conversation memory & start fresh session\n"
-            "    /model <name>    View active model or switch to another Ollama model on the fly\n"
-            "    /status          Show current workspace, server base URL, and configuration\n"
-            "    /exit, /quit     Exit opencode-lite\n"
-            "\n"
-            "  KEYBOARD SHORTCUTS:\n"
-            "    Enter            Send user prompt to the agent\n"
-            "    Ctrl+C           Cancel active streaming generation (or quit if idle)\n"
-            "    Ctrl+L           Clear chat screen viewport\n"
-            "    Ctrl+R           Reset agent conversation memory\n"
-            "    Ctrl+Q           Quit opencode-lite immediately\n"
-            "\n"
-            "  BUILT-IN TOOLS (AUTONOMOUS):\n"
-            "    * read_file(path, start_line)   Read files in workspace with line numbers\n"
-            "    * write_file(path, content)     Create or update files in workspace\n"
-            "    * delete_file(path)             Permanently delete a file (gated by confirmation)\n"
-            "    * list_files(path, pattern)     List workspace directory entries via glob\n"
-            "    * shell(command)                Execute shell commands (gated by confirmation)\n"
-            "    * webfetch(url)                 Fetch webpage text content directly\n"
-            "    * websearch(query)              Search the web via DuckDuckGo\n"
-            "\n"
-            "  PERMISSIONS & CONFIGURATION:\n"
-            "    Configuration lives at: ~/.opencode-lite/config.toml\n"
-            "    Tool permissions can be set to: 'allow' | 'ask' | 'deny'\n"
-            "==================================================================================\n"
-        )
-        self._chat().write(Text(help_guide, style="bright_cyan"))
-
-    def _cancel_generation(self) -> bool:
-        if not self._busy:
-            return False
-        cancelled = getattr(self.agent, "cancelled", None)
-        if isinstance(cancelled, bool):
-            self.agent.cancelled = True
-        self._set_status(f"{self._model_label()} | cancelling...")
-        return True
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        if not text or self._busy:
-            event.input.value = ""
-            return
-        event.input.value = ""
-
-        if text.startswith("/"):
-            parts = text.split(maxsplit=1)
-            cmd = parts[0].lower()
-            arg = parts[1] if len(parts) > 1 else ""
-
-            if cmd in ("/help", "/?", "/h"):
-                self.action_show_help()
-                return
-            elif cmd in ("/clear", "/cls"):
-                self.action_clear_log()
-                return
-            elif cmd in ("/reset", "/restart"):
-                self.action_reset_agent()
-                return
-            elif cmd in ("/exit", "/quit", "/q"):
-                self.exit()
-                return
-            elif cmd == "/status":
-                ws = getattr(self.config, "workspace", ".")
-                mdl = self._model_label()
-                url = getattr(self.config, "base_url", "http://127.0.0.1:11434/v1")
-                self._chat().write(Text(f"Model: {mdl} | Base URL: {url}\nWorkspace: {ws}\n", style="dim"))
-                return
-            elif cmd == "/model":
-                if arg:
-                    if hasattr(self.config, "model"):
-                        self.config.model = arg
-                    if hasattr(self.agent, "client") and hasattr(self.agent.client, "model"):
-                        self.agent.client.model = arg
-                    self._chat().write(Text(f"Model switched to: {arg}\n", style="green"))
-                    self._set_status(f"{arg} | idle")
-                else:
-                    self._chat().write(Text(f"Active model: {self._model_label()}\n", style="dim"))
-                return
-
-        self._chat().write(Text(f"> {text}\n", style="bold"))
-        self._start_generation(text)
-
-    def _start_generation(self, text: str) -> None:
-        self._busy = True
-        inp = self._input()
-        inp.disabled = True
-        self._set_status(f"{self._model_label()} | thinking...")
-        thread = threading.Thread(
-            target=self._run_submit, args=(text,), name="agent-submit", daemon=True
-        )
-        thread.start()
-
-    def _run_submit(self, text: str) -> None:
-        try:
-            self.agent.submit(text)
-        except Exception as exc:
-            try:
-                self.hooks.on_error(f"{type(exc).__name__}: {exc}")
-            except Exception:
-                pass
-        finally:
-            self._busy = False
-            self._ui(self._finish_turn)
-
-    def _finish_turn(self) -> None:
-        inp = self._input()
-        inp.disabled = False
-        inp.focus()
-        self._set_status(f"{self._model_label()} | idle")
+            agent.hooks = self.hooks

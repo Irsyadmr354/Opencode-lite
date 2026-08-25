@@ -116,74 +116,39 @@ def test_tag_holdback_units():
     assert f("[thinkin", False) == 8        # partial bracket opener
 
 
-# --- UI rendering ------------------------------------------------------------
+# --- TerminalHooks UI rendering ----------------------------------------------
 
-class ReasonFakeAgent:
-    def __init__(self, split_tags: bool = False):
-        self.hooks = None
-        self.messages: list[dict] = []
-        self.cancelled = False
-        self._split_tags = split_tags
-
-    def reset(self) -> None:
-        self.messages.clear()
-
-    def submit(self, text: str) -> None:
-        h = self.hooks
-        if self._split_tags:
-            for chunk in ("I wonder <thi", "nk>secret plan</thin", "k>so, proceed"):
-                h.on_delta(chunk)
-            h.on_assistant_done(SimpleNamespace(
-                content="I wonder <think>secret plan</think>so, proceed",
-                tool_calls=[]))
-            return
-        h.on_reasoning("thinking hard\nabout it")
-        h.on_delta("answer here")
-        h.on_assistant_done(SimpleNamespace(
-            content="answer here", tool_calls=[], reasoning="thinking hard\nabout it"))
+import io
 
 
-def _log_text(app) -> str:
-    chat = app.query_one("#chat", ui_mod.RichLog)
-    return "\n".join("".join(seg.text for seg in strip) for strip in chat.lines)
+def test_ui_renders_reasoning_field():
+    out = io.StringIO()
+    hooks = ui_mod.TerminalHooks(stdout=out)
+    hooks.on_reasoning("thinking hard\nabout it")
+    hooks.on_delta("answer here")
+    hooks.on_assistant_done(SimpleNamespace(content="answer here", reasoning="thinking hard\nabout it"))
+
+    output = out.getvalue()
+    assert ui_mod.ANSI_THINKING in output
+    assert "thinking hard" in output
+    assert "about it" in output
+    assert "answer here" in output
 
 
-def test_ui_renders_reasoning_field(tmp_path):
-    agent = ReasonFakeAgent()
-    app = ui_mod.ChatApp(agent, SimpleNamespace(model="fake", workspace=tmp_path))
-
-    async def scenario():
-        async with app.run_test(size=(100, 30)) as pilot:
-            inp = app.query_one("#input", ui_mod.Input)
-            inp.value = "go"
-            await pilot.press("enter")
-            deadline = asyncio.get_event_loop().time() + 8
-            while asyncio.get_event_loop().time() < deadline and app._busy:
-                await asyncio.sleep(0.05)
-            assert not app._busy
-            text = _log_text(app)
-            assert "thinking hard" in text and "about it" in text
-            assert "answer here" in text
-
-    asyncio.run(scenario())
-
-
-def test_ui_split_tag_no_leak(tmp_path):
+def test_ui_split_tag_no_leak():
     """'<thi|nk>' split across deltas must still parse as a think block."""
-    agent = ReasonFakeAgent(split_tags=True)
-    app = ui_mod.ChatApp(agent, SimpleNamespace(model="fake", workspace=tmp_path))
+    out = io.StringIO()
+    hooks = ui_mod.TerminalHooks(stdout=out)
+    for chunk in ("I wonder <thi", "nk>secret plan</thin", "k>so, proceed"):
+        hooks.on_delta(chunk)
+    hooks.on_assistant_done(SimpleNamespace(content="I wonder <think>secret plan</think>so, proceed"))
 
-    async def scenario():
-        async with app.run_test(size=(100, 30)) as pilot:
-            inp = app.query_one("#input", ui_mod.Input)
-            inp.value = "go"
-            await pilot.press("enter")
-            deadline = asyncio.get_event_loop().time() + 8
-            while asyncio.get_event_loop().time() < deadline and app._busy:
-                await asyncio.sleep(0.05)
-            assert not app._busy
-            text = _log_text(app)
-            assert "secret plan" in text
-            assert "proceed" in text
+    output = out.getvalue()
+    assert "I wonder " in output
+    assert ui_mod.ANSI_THINKING in output
+    assert "secret plan" in output
+    assert "so, proceed" in output
+    # Must not have raw tag literals leaked in output
+    assert "<think>" not in output
+    assert "</think>" not in output
 
-    asyncio.run(scenario())

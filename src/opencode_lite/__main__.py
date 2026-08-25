@@ -198,16 +198,10 @@ def main(argv: list[str] | None = None) -> int:
         agent.submit(ns.print_mode)
         return 1 if console_hooks.had_error else 0
 
-    from opencode_lite.ui import ChatApp  # deferred: TUI only needs this branch
+    from opencode_lite.ui import run_repl
 
-    agent = Agent(client, tools, config, Hooks())  # no-op hooks until UI attaches its own
-    app = ChatApp(agent, config)
-    try:
-        agent.hooks = app.hooks  # swap in thread-safe UI hooks before first submit
-    except Exception as exc:  # noqa: BLE001 - Agent may expose hooks differently
-        print(f"WARN: could not attach UI hooks to agent ({exc}); "
-              f"tool/status events may not appear.", file=sys.stderr)
-    app.run()
+    agent = Agent(client, tools, config, Hooks())
+    run_repl(agent, config)
     return 0
 
 
