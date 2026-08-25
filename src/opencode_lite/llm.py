@@ -155,7 +155,49 @@ class LLMClient:
             tool_calls.append(ToolCall(id=slot["id"] or f"call_{index}",
                                        name=slot["name"], arguments=args))
 
-        turn = AssistantTurn(content="".join(content_parts) or None,
+        # If native tool_calls were not parsed from SSE, check if model dumped tool calls in content
+        raw_content = "".join(content_parts)
+        if not tool_calls and raw_content:
+            # 1. Check for XML tags <tool_call>...</tool_call>
+            import re
+            for m in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", raw_content, re.DOTALL):
+                try:
+                    obj = json.loads(m.group(1).strip())
+                    if isinstance(obj, dict) and "name" in obj:
+                        args = obj.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                pass
+                        tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=obj["name"], arguments=args if isinstance(args, dict) else {}))
+                except Exception:
+                    pass
+
+            # 2. Check for raw json function call strings
+            if not tool_calls:
+                clean_c = raw_content.strip()
+                if clean_c.startswith('{"type":"function"') or clean_c.startswith('{"name":'):
+                    try:
+                        obj = json.loads(clean_c)
+                        fn = obj.get("function") if "function" in obj else obj
+                        if isinstance(fn, dict) and "name" in fn:
+                            args = fn.get("arguments", {})
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except Exception:
+                                    pass
+                            elif "query" in fn:
+                                args = {"query": fn["query"]}
+                            elif "path" in fn:
+                                args = {"path": fn["path"]}
+                            tool_calls.append(ToolCall(id="call_fallback", name=fn["name"], arguments=args if isinstance(args, dict) else {}))
+                            raw_content = ""
+                    except Exception:
+                        pass
+
+        turn = AssistantTurn(content=raw_content or None,
                              tool_calls=tool_calls, finish_reason=finish_reason,
                              reasoning="".join(reasoning_parts) or None)
         yield {"type": "final", "turn": turn}
