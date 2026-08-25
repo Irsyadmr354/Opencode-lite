@@ -55,6 +55,7 @@ def test_public_contract(tmp_path):
     assert {t.name for t in tools} == {
         "read_file", "write_file", "delete_file",
         "list_files", "shell", "webfetch", "websearch",
+        "get_current_time",
     }
     assert all(t.fn is not None and isinstance(t.parameters, dict) for t in tools)
     assert sorted(t.name for t in tools if t.danger) == ["delete_file", "shell"]
@@ -66,7 +67,7 @@ def test_public_contract(tmp_path):
 
     # every tool with required args reports a missing-argument error, never raises
     for tool in tools:
-        if tool.name == "list_files":  # has no required args
+        if tool.name in ("list_files", "get_current_time"):  # has no required args
             continue
         res = tool.fn({})
         assert isinstance(res, ToolResult)

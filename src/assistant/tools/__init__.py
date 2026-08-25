@@ -40,6 +40,7 @@ class Tool:
 # --- imported after shared types so submodules can bind them -----------------
 from .fs import build_tools as _build_fs_tools  # noqa: E402
 from .shell import build_tools as _build_shell_tools  # noqa: E402
+from .time import build_tools as _build_time_tools  # noqa: E402
 from .web import build_tools as _build_web_tools  # noqa: E402
 
 
@@ -49,7 +50,8 @@ def get_tools(workspace: pathlib.Path, config) -> list[Tool]:
     Safe tools come first, dangerous ones last (UI groups/paints by ``danger``).
     """
     return (
-        _build_fs_tools(workspace, config)
+        _build_time_tools(workspace, config)
+        + _build_fs_tools(workspace, config)
         + _build_web_tools(workspace, config)
         + _build_shell_tools(workspace, config)
     )

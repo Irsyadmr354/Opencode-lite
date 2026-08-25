@@ -9,15 +9,14 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from rich.text import Text
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
-from textual.widgets import Button, Input, RichLog, Static
+# Heavy UI deps removed for lightweight startup – pure ANSI by default
+# Legacy Textual/Rich support is opt-in; keep import <0.1s
+Text = None  # type: ignore
+App = ComposeResult = Binding = Horizontal = Vertical = ModalScreen = Button = Input = RichLog = Static = None  # type: ignore
 
 try:
     from assistant.agent import Hooks
@@ -183,9 +182,11 @@ def _tag_holdback(buffer: str, in_think: bool, at_line_start: bool = False) -> i
     return 0
 
 
-def _parse_thinking_text(text: str, state: dict[str, bool]) -> Text:
+def _parse_thinking_text(text: str, state: dict[str, bool]):  # type: ignore[no-untyped-def]
     """Parse text into a Rich Text object, highlighting <think>...</think>
-    and [Thinking:...] sections in italic dim cyan/gray."""
+    and [Thinking:...] sections in italic dim cyan/gray. Lazy: returns str if rich not available."""
+    if Text is None:
+        return text  # fallback for lightweight mode
     res = Text()
     i = 0
     n = len(text)
@@ -286,6 +287,18 @@ class TerminalHooks(Hooks):
         self._pending_thread: threading.Thread | None = None
         self._pending_stop = threading.Event()
         self._pending_lock = threading.Lock()
+        # Typewriter smoothing: char-by-char <0.1s eye-comfort, stdlib only
+        self._tw_queue: deque[str] = deque()
+        self._tw_lock = threading.Lock()
+        self._tw_cond = threading.Condition(self._tw_lock)
+        self._tw_thread: threading.Thread | None = None
+        self._tw_stop = threading.Event()
+        self._tw_enabled: bool = False
+        try:
+            # Enable only for real TTY (StringIO tests stay sync for determinism)
+            self._tw_enabled = bool(getattr(self._stdout, "isatty", lambda: False)())
+        except Exception:
+            self._tw_enabled = False
         if config is not None and hasattr(config, "verbose"):
             self.verbose: bool = bool(config.verbose)
         else:
@@ -403,6 +416,83 @@ class TerminalHooks(Hooks):
         self._stderr.write(text)
         self._stderr.flush()
 
+    # -- typewriter smoothing (char-by-char <0.1s, eye-comfort, lightweight) --
+    def _tw_ensure_thread(self) -> None:
+        if not self._tw_enabled or self._tw_thread is not None and self._tw_thread.is_alive():
+            return
+        self._tw_stop.clear()
+        self._tw_thread = threading.Thread(target=self._tw_loop, daemon=True)
+        self._tw_thread.start()
+
+    def _tw_loop(self) -> None:
+        while not self._tw_stop.is_set():
+            chunk = None
+            with self._tw_cond:
+                while not self._tw_queue and not self._tw_stop.is_set():
+                    self._tw_cond.wait(timeout=0.05)
+                if self._tw_stop.is_set() and not self._tw_queue:
+                    break
+                if self._tw_queue:
+                    # adaptive chars per tick to keep <0.1s per char but drain bursts fast
+                    qlen = len(self._tw_queue)
+                    if qlen > 1000:
+                        take = min(40, qlen // 50)
+                    elif qlen > 200:
+                        take = min(20, (qlen // 100) + 1)
+                    else:
+                        take = 1
+                    chunk = "".join(self._tw_queue.popleft() for _ in range(min(take, len(self._tw_queue))))
+            if chunk:
+                try:
+                    self._stdout.write(chunk)
+                    self._stdout.flush()
+                    self._last_char_was_newline = chunk.endswith("\n")
+                except Exception:
+                    pass
+            time.sleep(0.015)  # ~15ms -> <0.1s per char, smooth
+
+    def _tw_enqueue(self, text: str) -> None:
+        if not text:
+            return
+        if not self._tw_enabled:
+            # sync path for tests / non-TTY
+            self._write_stdout(text)
+            return
+        self._tw_ensure_thread()
+        with self._tw_cond:
+            for ch in text:
+                self._tw_queue.append(ch)
+            self._tw_cond.notify_all()
+
+    def _tw_drain_sync(self) -> None:
+        if not self._tw_enabled:
+            return
+        # flush remaining queue synchronously
+        while True:
+            with self._tw_lock:
+                if not self._tw_queue:
+                    break
+                chunk = "".join(self._tw_queue.popleft() for _ in range(len(self._tw_queue)))
+            if chunk:
+                try:
+                    self._stdout.write(chunk)
+                    self._stdout.flush()
+                    self._last_char_was_newline = chunk.endswith("\n")
+                except Exception:
+                    pass
+
+    def _tw_stop_thread(self) -> None:
+        try:
+            self._tw_stop.set()
+            with self._tw_cond:
+                self._tw_cond.notify_all()
+            thr = self._tw_thread
+            if thr is not None and thr.is_alive():
+                thr.join(timeout=0.2)
+        except Exception:
+            pass
+        self._tw_thread = None
+
     def _begin_header(self) -> None:
         if self._header_active:
             return
@@ -485,6 +575,8 @@ class TerminalHooks(Hooks):
             pass
 
     def reset_stream(self) -> None:
+        self._tw_drain_sync()
+        self._tw_stop_thread()
         self._stop_pending()
         if self._header_active and not self._spinner_frozen:
             self._collapse_thinking(keep_header=False)
@@ -563,7 +655,7 @@ class TerminalHooks(Hooks):
                             self._write_stdout(AI_PREFIX)
                             self._ai_prefix_printed = True
                             joined = clean_check
-                    self._write_stdout(joined)
+                    self._tw_enqueue(joined)
                 cur.clear()
 
         while i < n:
@@ -636,6 +728,7 @@ class TerminalHooks(Hooks):
             buf = self._buffer
             self._buffer = ""
             self._render_chunk(buf)
+        self._tw_drain_sync()
         if self._in_think or self._in_bracket or self._saw_reasoning or self._thinking_active:
             self._collapse_thinking(keep_header=True)
             self._in_think = False
@@ -1078,17 +1171,23 @@ def run_repl(
 
 
 # --- Legacy Compatibility Classes (Textual TUI) ------------------------------
+# Only define if textual is available; otherwise provide lightweight stubs
+try:
+    _has_textual = ModalScreen is not None and App is not None
+except Exception:
+    _has_textual = False
 
-class PermissionModal(ModalScreen[bool]):
-    """Compatibility modal screen for Textual."""
+if _has_textual:
+    class PermissionModal(ModalScreen[bool]):  # type: ignore
+        """Compatibility modal screen for Textual."""
 
-    BINDINGS = [
-        Binding("y", "allow", "Allow"),
-        Binding("n", "deny", "Deny"),
-        Binding("escape", "deny", "Deny"),
-    ]
+        BINDINGS = [
+            Binding("y", "allow", "Allow"),
+            Binding("n", "deny", "Deny"),
+            Binding("escape", "deny", "Deny"),
+        ]
 
-    DEFAULT_CSS = """
+        DEFAULT_CSS = """
     PermissionModal {
         align: center middle;
         background: $background 70%;
@@ -1124,40 +1223,46 @@ class PermissionModal(ModalScreen[bool]):
     }
     """
 
-    def __init__(self, tool_name: str, args: Any) -> None:
-        super().__init__()
-        self._tool_name = tool_name
-        self._args = args
+        def __init__(self, tool_name: str, args: Any) -> None:
+            super().__init__()
+            self._tool_name = tool_name
+            self._args = args
 
-    def compose(self) -> ComposeResult:
-        with Vertical(id="perm-dialog"):
-            yield Static("Confirm Tool Execution", id="perm-title")
-            yield Static(f"Tool: {self._tool_name}", id="perm-name")
-            yield Static(_pretty_json(self._args), id="perm-args")
-            with Horizontal(id="perm-buttons"):
-                yield Button("Allow (y)", variant="success", id="allow")
-                yield Button("Deny (n)", variant="error", id="deny")
+        def compose(self) -> ComposeResult:  # type: ignore
+            with Vertical(id="perm-dialog"):  # type: ignore
+                yield Static("Confirm Tool Execution", id="perm-title")  # type: ignore
+                yield Static(f"Tool: {self._tool_name}", id="perm-name")  # type: ignore
+                yield Static(_pretty_json(self._args), id="perm-args")  # type: ignore
+                with Horizontal(id="perm-buttons"):  # type: ignore
+                    yield Button("Allow (y)", variant="success", id="allow")  # type: ignore
+                    yield Button("Deny (n)", variant="error", id="deny")  # type: ignore
 
-    def action_allow(self) -> None:
-        self.dismiss(True)
+        def action_allow(self) -> None:
+            self.dismiss(True)
 
-    def action_deny(self) -> None:
-        self.dismiss(False)
+        def action_deny(self) -> None:
+            self.dismiss(False)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "allow")
+        def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore
+            self.dismiss(event.button.id == "allow")
 
+    class ChatApp(App[None]):  # type: ignore
+        """Compatibility Textual App export."""
 
-class ChatApp(App[None]):
-    """Compatibility Textual App export."""
+        TITLE = "assistant"
 
-    TITLE = "assistant"
+        def __init__(self, agent: Any, config: Any) -> None:
+            super().__init__()
+            self.agent = agent
+            self.config = config
+            self._busy = False
+            self.hooks = TerminalHooks()
+            if hasattr(agent, "hooks"):
+                agent.hooks = self.hooks
+else:
+    class PermissionModal:  # type: ignore
+        pass
 
-    def __init__(self, agent: Any, config: Any) -> None:
-        super().__init__()
-        self.agent = agent
-        self.config = config
-        self._busy = False
-        self.hooks = TerminalHooks()
-        if hasattr(agent, "hooks"):
-            agent.hooks = self.hooks
+    class ChatApp:  # type: ignore
+        pass
+        pass

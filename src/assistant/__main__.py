@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -11,6 +9,10 @@ from typing import Any
 
 VERSION = "0.1.0"
 DEFAULT_CONFIG_PATH = Path.home() / ".assistant" / "config.toml"
+
+# Pure ANSI, no new deps — eye-comfort dim for banner/footer.
+ANSI_DIM = "\033[2m"
+ANSI_RESET = "\033[0m"
 
 SAMPLE_CONFIG = '''\
 # assistant configuration (sample, written once)
@@ -179,11 +181,13 @@ def build_console_hooks(hooks_base: type) -> type:
                     line = self._format_verbose(turn)
                 except Exception:
                     line = "(no stats)"
-                print(f"\033[2m⏱ {line}\033[0m", file=sys.stderr, flush=True)
+                print(f"{ANSI_DIM}⏱ {line}{ANSI_RESET}", file=sys.stderr, flush=True)
 
         def on_tool_start(self, name: str, args: dict) -> None:
+            import json as _json
+
             try:
-                compact = json.dumps(args, separators=(",", ":"), default=str)
+                compact = _json.dumps(args, separators=(",", ":"), default=str)
             except (TypeError, ValueError):
                 compact = str(args)
             print(f"-> tool {name} {compact}", flush=True)
@@ -239,13 +243,15 @@ def ensure_sample_config(config_path: Path) -> None:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         if os.access(config_path.parent, os.W_OK):
             config_path.write_text(SAMPLE_CONFIG, encoding="utf-8")
-            print(f"[info] sample config written: {config_path}", file=sys.stderr)
+            print(f"{ANSI_DIM}[info] sample config written: {config_path}{ANSI_RESET}", file=sys.stderr)
     except OSError:
         pass  # read-only home etc. -> keep built-in defaults silently
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+def build_parser():  # lazy argparse -> keep import time <1s
+    import argparse as _argparse
+
+    parser = _argparse.ArgumentParser(
         prog="assistant",
         description="Minimal TUI coding agent for local models (Ollama).",
     )
