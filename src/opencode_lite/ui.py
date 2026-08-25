@@ -548,7 +548,6 @@ def _get_help_text() -> str:
         f"  {ANSI_BOLD}COMMANDS:{ANSI_RESET}\n"
         f"    {ANSI_CYAN}/help{ANSI_RESET}            Display this comprehensive reference guide\n"
         f"    {ANSI_CYAN}/clear{ANSI_RESET}           Clear screen & reset conversation context memory\n"
-        f"    {ANSI_CYAN}/reset{ANSI_RESET}           Reset conversation memory only (keep terminal view)\n"
         f"    {ANSI_CYAN}/cls{ANSI_RESET}             Clear terminal screen view only\n"
         f"    {ANSI_CYAN}/model [name]{ANSI_RESET}    View active model or switch to another Ollama model on the fly\n"
         f"    {ANSI_CYAN}/status{ANSI_RESET}          Show current workspace, model, base URL, and permissions\n"
@@ -658,13 +657,6 @@ def run_repl(
                     agent.reset()
                 elif hasattr(agent, "messages"):
                     agent.messages.clear()
-                continue
-            elif cmd in ("/reset", "/restart"):
-                if hasattr(agent, "reset"):
-                    agent.reset()
-                elif hasattr(agent, "messages"):
-                    agent.messages.clear()
-                _print(f"{ANSI_DIM}Session memory reset.{ANSI_RESET}\n")
                 continue
             elif cmd == "/model":
                 if arg:

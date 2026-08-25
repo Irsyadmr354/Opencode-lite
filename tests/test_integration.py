@@ -267,7 +267,7 @@ def test_repl_commands_status_model_reset_help(tmp_path):
         "/status",
         "/model",
         "/model deepseek-coder:14b",
-        "/reset",
+        "/clear",
         "/help",
         "/quit",
     ])
@@ -290,8 +290,7 @@ def test_repl_commands_status_model_reset_help(tmp_path):
     assert "Model switched to: deepseek-coder:14b" in combined
     assert cfg.model == "deepseek-coder:14b"
     assert agent.client.model == "deepseek-coder:14b"
-    # /reset check
-    assert "Session memory reset." in combined
+    # /clear resets messages
     assert agent.messages == []
     # /help check
     assert "OPENCODE-LITE GUIDE" in combined
