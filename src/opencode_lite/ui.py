@@ -546,7 +546,7 @@ UiHooks = TerminalHooks
 def _get_help_text() -> str:
     return (
         f"\n"
-        f"{ANSI_BOLD}============================== OPENCODE-LITE GUIDE =============================={ANSI_RESET}\n"
+        f"{ANSI_BOLD}================================ ASSISTANT GUIDE ================================{ANSI_RESET}\n"
         f"\n"
         f"  {ANSI_BOLD}COMMANDS:{ANSI_RESET}\n"
         f"    {ANSI_CYAN}/help{ANSI_RESET}            Display this comprehensive reference guide\n"
@@ -554,12 +554,12 @@ def _get_help_text() -> str:
         f"    {ANSI_CYAN}/cls{ANSI_RESET}             Clear terminal screen view only\n"
         f"    {ANSI_CYAN}/model [name]{ANSI_RESET}    View active model or switch to another Ollama model on the fly\n"
         f"    {ANSI_CYAN}/status{ANSI_RESET}          Show current workspace, model, base URL, and permissions\n"
-        f"    {ANSI_CYAN}/exit, /quit{ANSI_RESET}     Exit opencode-lite\n"
+        f"    {ANSI_CYAN}/exit, /quit{ANSI_RESET}     Exit assistant\n"
         f"\n"
         f"  {ANSI_BOLD}KEYBOARD SHORTCUTS:{ANSI_RESET}\n"
         f"    {ANSI_BOLD}Enter{ANSI_RESET}            Send prompt to the agent\n"
         f"    {ANSI_BOLD}Ctrl+C{ANSI_RESET}           Cancel active streaming generation / reset prompt\n"
-        f"    {ANSI_BOLD}Ctrl+D / Ctrl+Z{ANSI_RESET}  Exit opencode-lite (EOF)\n"
+        f"    {ANSI_BOLD}Ctrl+D / Ctrl+Z{ANSI_RESET}  Exit assistant (EOF)\n"
         f"\n"
         f"  {ANSI_BOLD}BUILT-IN TOOLS (AUTONOMOUS):{ANSI_RESET}\n"
         f"    * {ANSI_BOLD}read_file(path, start_line){ANSI_RESET}   Read files in workspace with line numbers\n"
@@ -586,7 +586,8 @@ def run_repl(
 ) -> None:
     """Run the pure native terminal REPL loop."""
     if config is None:
-        config = getattr(agent, "config", None)
+        from opencode_lite.config import Config
+        config = Config.load()
 
     # Enable ANSI escape sequences on Windows if possible
     if os.name == "nt":
@@ -613,7 +614,7 @@ def run_repl(
     workspace = getattr(config, "workspace", Path.cwd())
 
     # Minimal banner in dim styling
-    _print(f"{ANSI_DIM}opencode-lite {VERSION} | model: {model} | workspace: {workspace}{ANSI_RESET}")
+    _print(f"{ANSI_DIM}assistant {VERSION} | model: {model} | workspace: {workspace}{ANSI_RESET}")
     _print(f"{ANSI_DIM}Type /help for commands, /exit to quit.{ANSI_RESET}\n")
 
     hooks = TerminalHooks(input_fn=_read_input)

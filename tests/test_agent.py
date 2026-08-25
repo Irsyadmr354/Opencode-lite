@@ -210,7 +210,7 @@ def test_tool_exception_becomes_error_message(harness):
 
 
 def test_system_prompt_contract():
-    assert "OpenCode-Lite" in SYSTEM_PROMPT
+    assert "Assistant" in SYSTEM_PROMPT
     assert "workspace" in SYSTEM_PROMPT
     assert len(SYSTEM_PROMPT.split()) < 50
 

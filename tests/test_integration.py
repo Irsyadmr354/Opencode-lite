@@ -293,7 +293,7 @@ def test_repl_commands_status_model_reset_help(tmp_path):
     # /clear resets messages
     assert agent.messages == []
     # /help check
-    assert "OPENCODE-LITE GUIDE" in combined
+    assert "ASSISTANT GUIDE" in combined
 
 
 def test_repl_clear_screen(tmp_path):

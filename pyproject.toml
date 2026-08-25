@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 opencode-lite = "opencode_lite.__main__:main"
+assistant = "opencode_lite.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
