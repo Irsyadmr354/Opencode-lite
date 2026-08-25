@@ -361,8 +361,8 @@ class TerminalHooks(Hooks):
                         self._thinking_lines += joined.count("\n")
                 else:
                     if not self._ai_prefix_printed and not self._in_think and not self._in_bracket:
-                        # Print Assistant prefix right where thinking was collapsed
-                        clean_check = joined.lstrip()
+                        # Print Assistant prefix right where thinking was collapsed or after tool result
+                        clean_check = joined.lstrip("\r\n")
                         if clean_check:
                             self._write_stdout(AI_PREFIX)
                             self._ai_prefix_printed = True
@@ -396,43 +396,25 @@ class TerminalHooks(Hooks):
                     i += 10
                     continue
 
-                # Strip roleplay asterisks at line start
-                if self._at_line_start and ch == "*":
-                    if i + 1 < n:
-                        next_ch = chunk[i + 1]
-                        if next_ch == "*":
-                            # Markdown bold "**"
-                            self._at_line_start = False
-                            cur.append("**")
-                            i += 2
-                            continue
-                        elif next_ch == " ":
-                            # Markdown bullet "* "
-                            self._at_line_start = False
-                            cur.append("* ")
-                            i += 2
-                            continue
-                        elif next_ch not in ("\n", "\r"):
-                            # Roleplay asterisk start -> skip leading asterisk
-                            self._at_line_start = False
-                            self._in_roleplay_asterisk = True
-                            i += 1
-                            continue
-                    else:
+                # Strip markdown/roleplay asterisks across plain terminal output
+                if ch == "*":
+                    if i + 1 < n and chunk[i + 1] == "*":
+                        # Double asterisk bold markdown: **text** -> text
+                        i += 2
+                        continue
+                    elif self._at_line_start and i + 1 < n and chunk[i + 1] == " ":
+                        # Bullet point '* ' -> '- '
+                        cur.append("- ")
                         self._at_line_start = False
-                        cur.append(ch)
+                        i += 2
+                        continue
+                    else:
+                        # Single asterisk italic/roleplay: *text* -> text
                         i += 1
                         continue
 
-                # Strip matching roleplay closing asterisk
-                if self._in_roleplay_asterisk and ch == "*":
-                    self._in_roleplay_asterisk = False
-                    i += 1
-                    continue
-
                 if ch == "\n":
                     self._at_line_start = True
-                    self._in_roleplay_asterisk = False
                 elif ch != " " and ch != "\r":
                     self._at_line_start = False
 
