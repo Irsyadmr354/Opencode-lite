@@ -312,7 +312,9 @@ def test_inline_thinking_split(harness, raw, expected_content, expected_reasonin
     turn = hooks.turns[0]
     assert turn.content == expected_content
     assert turn.reasoning == expected_reasoning
-    assert agent.messages[-1].get("content") == expected_content
+    # Wire format must never be null (Go <nil>) - empty string is used instead
+    expected_msg = expected_content if expected_content is not None else ""
+    assert agent.messages[-1].get("content") == expected_msg
     assert "<think>" not in json.dumps(agent.messages)
 
 

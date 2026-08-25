@@ -111,13 +111,59 @@ class LLMClient:
         pending: dict[int, dict] = {}  # tool_call index -> {id, name, arguments}
         finish_reason: str | None = None
 
+        def _clean_error_body(raw: str) -> str:
+            # Ollama often double-encodes Jinja errors: {"error":{"message":"{\"error\":{\"message\":\"...\"}}"}}
+            # Extract the innermost human message
+            try:
+                outer = json.loads(raw)
+                # Try outer.error.message
+                msg = None
+                if isinstance(outer, dict):
+                    err = outer.get("error")
+                    if isinstance(err, dict):
+                        msg = err.get("message")
+                    elif isinstance(err, str):
+                        msg = err
+                    if msg and isinstance(msg, str):
+                        # msg may itself be JSON
+                        msg_stripped = msg.strip()
+                        if msg_stripped.startswith("{"):
+                            try:
+                                inner = json.loads(msg_stripped)
+                                inner_err = inner.get("error") if isinstance(inner, dict) else None
+                                if isinstance(inner_err, dict) and inner_err.get("message"):
+                                    msg = inner_err["message"]
+                                elif isinstance(inner, dict) and inner.get("message"):
+                                    msg = inner["message"]
+                            except Exception:
+                                pass
+                        # Clean Jinja trace: keep only first line with raise_exception
+                        if "raise_exception" in msg:
+                            # Extract the quoted message inside raise_exception('...')
+                            m = re.search(r"raise_exception\(['\"]([^'\"]+)['\"]\)", msg)
+                            if m:
+                                msg = m.group(1)
+                        # Truncate long traces
+                        msg = msg.split("\n")[0].strip()
+                        if msg:
+                            return msg
+                # Fallback: return raw truncated
+                return raw[:300].strip()
+            except Exception:
+                return raw[:300].strip()
+
         try:
             with httpx.Client(timeout=self.timeout_s) as client:
                 with client.stream("POST", f"{self.base_url}/chat/completions",
                                    json=payload, headers=headers) as resp:
                     if resp.status_code // 100 != 2:
-                        body = resp.read().decode("utf-8", "replace")
-                        raise LLMError(f"HTTP {resp.status_code}: {body[:300]}")
+                        raw = resp.read().decode("utf-8", "replace")
+                        clean = _clean_error_body(raw)
+                        # Hint for common template error
+                        hint = ""
+                        if "No user query" in clean:
+                            hint = " — coba /clear atau /session new untuk reset history (template butuh user message)"
+                        raise LLMError(f"HTTP {resp.status_code}: {clean}{hint}")
 
                     raw_lines: list[str] = []
                     saw_sse = False

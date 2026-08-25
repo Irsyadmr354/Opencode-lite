@@ -741,6 +741,15 @@ class TerminalHooks(Hooks):
     def on_error(self, msg: str) -> None:
         """Error messages formatted in red."""
         self._stop_pending()
+        # Ensure Thinking header doesn't stay stuck next to ERROR
+        if self._header_active:
+            try:
+                self._collapse_thinking(keep_header=False)
+            except Exception:
+                pass
+            # Ensure next output starts on fresh line
+            if not self._last_char_was_newline:
+                self._write_stdout("\n")
         self.had_error = True
         self._write_stderr(f"{ANSI_BOLD_RED}ERROR:{ANSI_RESET} {ANSI_RED}{msg}{ANSI_RESET}\n")
 

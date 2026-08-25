@@ -215,12 +215,32 @@ class Agent:
                     newest_user = idx
             if newest_user <= 1:
                 break  # only the newest user turn remains; nothing safely prunable
-            end = 2
+            # Determine removable UNIT starting at 1, never including the newest user
             head = self.messages[1]
-            if head.get("role") == "assistant" and head.get("tool_calls"):
+            end = 2
+            if head.get("role") == "user":
+                # User turn: include the following assistant (with or without tool_calls) and its tools
+                # so we don't leave a dangling assistant/tool without its user query
+                # which triggers Jinja "No user query found" on some templates
+                if end < len(self.messages) and self.messages[end].get("role") == "assistant":
+                    end += 1
+                    # Include any immediately following tool results
+                    while end < len(self.messages) and self.messages[end].get("role") == "tool":
+                        end += 1
+                # Safety: don't delete the newest user
+                if newest_user < end:
+                    # The unit would include the newest user, so just delete the single old user
+                    # (should not happen since newest_user is last, but keep safe)
+                    end = 2
+                    if 1 <= newest_user < end:
+                        break
+            elif head.get("role") == "assistant" and head.get("tool_calls"):
                 while (end < len(self.messages)
                        and self.messages[end].get("role") == "tool"):
                     end += 1
+            # Final safety: never delete the newest user
+            if 1 <= newest_user < end:
+                break
             del self.messages[1:end]
 
     # -- public API ----------------------------------------------------------
