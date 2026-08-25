@@ -626,13 +626,13 @@ def run_repl(
         except KeyboardInterrupt:
             if last_was_sigint:
                 _print(f"\n{ANSI_DIM}Goodbye!{ANSI_RESET}")
-                break
+                return
             last_was_sigint = True
             _print(f"\n{ANSI_DIM}Type /exit or press Ctrl+C again to quit.{ANSI_RESET}")
             continue
         except EOFError:
             _print(f"\n{ANSI_DIM}Goodbye!{ANSI_RESET}")
-            break
+            return
 
         if not user_input:
             continue

@@ -201,7 +201,10 @@ def main(argv: list[str] | None = None) -> int:
     from opencode_lite.ui import run_repl
 
     agent = Agent(client, tools, config, Hooks())
-    run_repl(agent, config)
+    try:
+        run_repl(agent, config)
+    except (KeyboardInterrupt, EOFError):
+        pass
     return 0
 
 
