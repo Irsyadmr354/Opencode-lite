@@ -98,7 +98,14 @@ class Agent:
         """Load conversation history from a saved session, replacing current messages."""
         from . import session as _session  # lazy import to avoid circular
 
-        self.messages = _session.load_session(name)
+        msgs = _session.load_session(name)
+        # Sanitize loaded messages (old files may have content=null)
+        for m in msgs:
+            if "content" not in m or m["content"] is None:
+                m["content"] = ""
+            elif not isinstance(m["content"], str):
+                m["content"] = str(m["content"])
+        self.messages = msgs
         self.cancelled = False
 
     def new_session(self) -> None:
@@ -132,9 +139,8 @@ class Agent:
         return total
 
     def _assistant_message(self, turn) -> dict:
-        msg: dict = {"role": "assistant"}
-        if turn.content:
-            msg["content"] = turn.content
+        # Always set content as string - Ollama rejects null/missing content (Go <nil>)
+        msg: dict = {"role": "assistant", "content": turn.content if isinstance(turn.content, str) else ""}
         if turn.tool_calls:
             msg["tool_calls"] = [
                 {
@@ -222,6 +228,12 @@ class Agent:
     def submit(self, user_text: str) -> None:
         """Run the full agent loop for one user request (blocking)."""
         self._prune_context()
+        # Sanitize existing messages: Ollama Go rejects content=null (<nil>)
+        for m in self.messages:
+            if "content" not in m or m["content"] is None:
+                m["content"] = ""
+            elif not isinstance(m["content"], str):
+                m["content"] = str(m["content"])
         self.messages.append({"role": "user", "content": user_text})
         self.cancelled = False
         # Immediate feedback: show spinner before any network wait (TTFT)
@@ -233,6 +245,12 @@ class Agent:
         max_rounds = max(1, int(self.config.max_tool_rounds))
 
         for rnd in range(1, max_rounds + 1):
+            # Show instant spinner for every LLM round (tool rounds have TTFT too)
+            if rnd > 1:
+                try:
+                    self.hooks.on_start()
+                except Exception:
+                    pass
             turn = None
             t0 = time.monotonic()
             t_first_token: float | None = None

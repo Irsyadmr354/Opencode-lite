@@ -505,6 +505,7 @@ class TerminalHooks(Hooks):
         if not text:
             return
         self._stop_pending()
+        self._spinner_frozen = False
         self._saw_reasoning = True
         self._thinking_active = True
         if not self._header_active:
