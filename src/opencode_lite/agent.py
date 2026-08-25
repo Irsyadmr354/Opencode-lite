@@ -8,24 +8,8 @@ from .config import Config
 from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for typing)
 
 SYSTEM_PROMPT = (
-    "You are a helpful, terse, and highly capable coding agent working inside a workspace.\n"
-    "\n"
-    "Tools available:\n"
-    "- read_file(path, start_line): read a file's contents.\n"
-    "- write_file(path, content): create or overwrite a file.\n"
-    "- delete_file(path): remove a file.\n"
-    "- list_files(path, pattern): list directory entries.\n"
-    "- shell(command): run a shell command.\n"
-    "- webfetch(url): fetch text from a URL.\n"
-    "- websearch(query): search the web.\n"
-    "\n"
-    "Rules:\n"
-    "1. When greeting or conversing, respond directly in plain text. Do NOT emit empty json or fake tool blocks.\n"
-    "2. Always read_file or list_files before editing; never guess file contents.\n"
-    "3. Prefer surgical edits; rewrite whole files only when necessary.\n"
-    "4. Paths are relative to the workspace root.\n"
-    "5. When calling tools, emit valid function calls. When done, summarize findings concisely.\n"
-    "6. You may include concise <think> reasoning thoughts </think> before taking action or answering."
+    "You are OpenCode-Lite, a terse and highly capable coding assistant working inside a local workspace.\n"
+    "Provide direct, helpful answers. Use tools only when inspecting, modifying, or querying workspace resources."
 )
 
 
@@ -44,6 +28,8 @@ class Hooks:
     """No-op lifecycle hooks; the UI subclasses this."""
 
     def on_delta(self, text: str) -> None: ...
+
+    def on_reasoning(self, text: str) -> None: ...
 
     def on_assistant_done(self, turn) -> None: ...
 
@@ -162,10 +148,16 @@ class Agent:
             output = str(res)
         return {"role": "tool", "tool_call_id": call.id, "content": output}
 
+    def _prune_context(self, max_tokens: int = 32000) -> None:
+        """Prune older conversation turns if context exceeds token budget, keeping system prompt."""
+        while len(self.messages) > 2 and self._approx_tokens() > max_tokens:
+            self.messages.pop(1)
+
     # -- public API ----------------------------------------------------------
 
     def submit(self, user_text: str) -> None:
         """Run the full agent loop for one user request (blocking)."""
+        self._prune_context()
         self.messages.append({"role": "user", "content": user_text})
         self.cancelled = False
         flag = _CancelFlag(self)
@@ -179,12 +171,18 @@ class Agent:
                                                      cancel=flag):
                     if event["type"] == "delta":
                         self.hooks.on_delta(event["text"])
+                    elif event["type"] == "reasoning":
+                        self.hooks.on_reasoning(event["text"])
                     elif event["type"] == "final":
                         turn = event["turn"]
             except LLMError as exc:
+                if self.messages and self.messages[-1].get("role") == "user":
+                    self.messages.pop()
                 self.hooks.on_error(str(exc))
                 return
             if turn is None:
+                if self.messages and self.messages[-1].get("role") == "user":
+                    self.messages.pop()
                 self.hooks.on_error("stream ended without final turn")
                 return
 
@@ -196,10 +194,13 @@ class Agent:
             if self.cancelled:  # stop between rounds; skip pending tool execution
                 return
             for call in turn.tool_calls:
+                if self.cancelled:
+                    break
                 self.messages.append(self._execute_tool(call))
             self.hooks.on_status({"round": rnd, "max": max_rounds,
                                   "approx_tokens": self._approx_tokens()})
             if self.cancelled:
                 return
+            self._prune_context()
 
         self.hooks.on_error("max tool rounds reached")

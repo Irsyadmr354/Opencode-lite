@@ -32,7 +32,7 @@ class Permissions:
 
 @dataclass
 class Config:
-    model: str = "qwen-coder-balanced"
+    model: str = "deepseek-r1-balanced"
     base_url: str = "http://127.0.0.1:11434/v1"
     api_key: str = "ollama"
     workspace: pathlib.Path = field(default_factory=pathlib.Path.cwd)
@@ -40,7 +40,11 @@ class Config:
     stream: bool = True
     limits: Limits = field(default_factory=Limits)
     permissions: Permissions = field(default_factory=Permissions)
-    shell_cmd: list[str] = field(default_factory=lambda: ["powershell", "-NoProfile", "-Command"])
+    shell_cmd: list[str] = field(
+        default_factory=lambda: ["powershell", "-NoProfile", "-Command"]
+        if os.name == "nt"
+        else ["/bin/sh", "-c"]
+    )
 
 
 _TOP_LEVEL_KEYS = {

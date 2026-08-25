@@ -210,10 +210,32 @@ def test_tool_exception_becomes_error_message(harness):
 
 
 def test_system_prompt_contract():
-    for name in ("read_file", "write_file", "delete_file", "list_files",
-                 "shell", "webfetch", "websearch"):
-        assert name in SYSTEM_PROMPT, f"SYSTEM_PROMPT must name {name}"
-    assert len(SYSTEM_PROMPT.split()) < 220
+    assert "OpenCode-Lite" in SYSTEM_PROMPT
+    assert "workspace" in SYSTEM_PROMPT
+    assert len(SYSTEM_PROMPT.split()) < 50
+
+
+def test_llm_error_cleans_unfulfilled_user_message(harness):
+    hooks = RecordingHooks()
+    # Script that raises 500 error on chat_stream
+    agent = harness([{"status": 500, "body": '{"error":"fail"}'}], hooks=hooks)
+    agent.submit("failed prompt")
+    assert hooks.errors != []
+    # User message must have been popped so state is not corrupted
+    assert [m["role"] for m in agent.messages] == ["system"]
+
+
+def test_context_pruning(harness):
+    agent = harness([])
+    # Fill with messages
+    agent.messages = [{"role": "system", "content": "system"}]
+    for i in range(100):
+        agent.messages.append({"role": "user", "content": "x" * 2000})
+        agent.messages.append({"role": "assistant", "content": "y" * 2000})
+    assert agent._approx_tokens() > 32000
+    agent._prune_context(max_tokens=5000)
+    assert agent.messages[0]["role"] == "system"
+    assert agent._approx_tokens() <= 5000
 
 
 # --- llm client -----------------------------------------------------------------

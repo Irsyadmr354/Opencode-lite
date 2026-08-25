@@ -53,6 +53,11 @@ def build_console_hooks(hooks_base: type) -> type:
             sys.stdout.write(text)
             sys.stdout.flush()
 
+        def on_reasoning(self, text: str) -> None:
+            # keep stdout clean for the actual answer; thinking goes to stderr
+            sys.stderr.write(text)
+            sys.stderr.flush()
+
         def on_assistant_done(self, turn: Any) -> None:
             if isinstance(turn, dict):
                 content = turn.get("content")

@@ -215,12 +215,16 @@ def test_webfetch_html_and_error(tmp_path, monkeypatch):
         lambda *a, **k: FakeResponse(
             200,
             {"content-type": "text/html"},
-            "<html><body><h1>Hi</h1><p>x</p></body></html>",
+            "<html><head><style>body { color: red; }</style></head><body><h1>Hi</h1><script>alert(1);</script><noscript>no js</noscript><svg><circle cx='5'/></svg><p>x</p></body></html>",
         ),
     )
     r = wf.fn({"url": "https://example.com/page"})
     assert r.ok
     assert "Hi" in r.output and "x" in r.output
+    assert "alert(1)" not in r.output
+    assert "color: red" not in r.output
+    assert "no js" not in r.output
+    assert "circle cx" not in r.output
 
     monkeypatch.setattr(
         web_mod.httpx,

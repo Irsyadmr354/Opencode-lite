@@ -32,6 +32,11 @@ def _chunk(delta: dict, finish_reason: str | None, model: str) -> dict:
 
 def _sse_payload(entry: dict, model: str) -> str:
     chunks = [_chunk({"role": "assistant"}, None, model)]
+    for rkey in ("reasoning", "reasoning_content"):
+        thought = entry.get(rkey)
+        if thought:
+            for piece in _split(thought, 2):
+                chunks.append(_chunk({rkey: piece}, None, model))
     content = entry.get("content")
     if content:
         for piece in _split(content, 2):
@@ -127,6 +132,11 @@ class FakeOllama:
                 if "status" in entry:
                     self._send_raw(entry.get("status", 500), entry.get("body", ""),
                                    "application/json")
+                    return
+                if "raw_json" in entry:
+                    # Plain JSON body (no SSE frames) -> exercises the client's
+                    # non-streaming fallback path.
+                    self._send_json(200, entry["raw_json"])
                     return
                 if outer.last_request.get("stream"):
                     body = _sse_payload(entry, outer.model).encode("utf-8")

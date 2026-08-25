@@ -18,6 +18,7 @@ try:
 except ImportError:
     class Hooks:
         def on_delta(self, text: str) -> None: ...
+        def on_reasoning(self, text: str) -> None: ...
         def on_assistant_done(self, turn: Any) -> None: ...
         def on_tool_start(self, name: str, args: dict) -> None: ...
         def on_tool_result(self, name: str, res: Any) -> None: ...
@@ -33,6 +34,26 @@ ARGS_PREVIEW_LINES = 30
 
 
 THINKING_STYLE = "italic dim cyan"
+MAX_LINE_CHARS = 80
+_TAG_OPENERS = ("<think>", "[thinking:")
+_TAG_CLOSER_THINK = "</think>"
+
+
+def _tag_holdback(buffer: str, in_think: bool) -> int:
+    """Length of buffer's trailing fragment that might be a PARTIAL tag token.
+
+    Prevents flushing text that ends in e.g. ``"<thi"`` — if that fragment
+    were rendered now, the completed ``"<think>"`` arriving next chunk would
+    no longer be recognised. Returns how many trailing characters to keep
+    buffered (0 when nothing is at risk).
+    """
+    candidates: tuple[str, ...] = (_TAG_CLOSER_THINK,) if in_think else _TAG_OPENERS
+    limit = min(max(len(c) for c in candidates) - 1, len(buffer))
+    for h in range(limit, 0, -1):
+        tail = buffer[-h:].lower()
+        if any(c.startswith(tail) and c != tail for c in candidates):
+            return h
+    return 0
 
 
 def _parse_thinking_text(text: str, state: dict[str, bool]) -> Text:
@@ -199,6 +220,12 @@ class ChatApp(App[None]):
         border: none;
         scrollbar-size: 0 0;
     }
+    #active-stream {
+        height: auto;
+        max-height: 15;
+        padding: 0 1;
+        background: transparent;
+    }
     #status {
         height: 1;
         padding: 0 1;
@@ -237,44 +264,62 @@ class ChatApp(App[None]):
             def __init__(self) -> None:
                 super().__init__()
                 self._current_delta_parts: list[str] = []
-                self._line_buffer: str = ""
+                self._reason_parts: list[str] = []
+                self._saw_reasoning: bool = False
                 self._think_state: dict[str, bool] = {"in_think": False, "in_bracket": False}
 
-            def _flush_line(self, line: str) -> None:
-                rendered = _parse_thinking_text(line, self._think_state)
-                outer._ui(lambda r=rendered: outer._chat().write(r))
+            def _render_active(self) -> Text:
+                res = Text()
+                if self._reason_parts:
+                    res.append("".join(self._reason_parts), style=THINKING_STYLE)
+                    if self._current_delta_parts:
+                        res.append("\n")
+                if self._current_delta_parts:
+                    content_so_far = "".join(self._current_delta_parts)
+                    res.append(_parse_thinking_text(content_so_far, {"in_think": False, "in_bracket": False}))
+                return res
+
+            def on_reasoning(self, text: str) -> None:
+                """Reasoning from the dedicated reasoning/reasoning_content field."""
+                self._saw_reasoning = True
+                self._reason_parts.append(text)
+                rendered = self._render_active()
+                outer._ui(lambda r=rendered: outer._active_stream().update(r))
 
             def on_delta(self, text: str) -> None:
                 self._current_delta_parts.append(text)
-                self._line_buffer += text
-
-                if "\n" in self._line_buffer:
-                    lines = self._line_buffer.split("\n")
-                    for line in lines[:-1]:
-                        self._flush_line(line)
-                    self._line_buffer = lines[-1]
-
-                while len(self._line_buffer) > 80:
-                    idx = self._line_buffer[:80].rfind(" ")
-                    if idx != -1:
-                        chunk = self._line_buffer[:idx]
-                        self._line_buffer = self._line_buffer[idx + 1 :]
-                        self._flush_line(chunk)
-                    else:
-                        break
+                rendered = self._render_active()
+                outer._ui(lambda r=rendered: outer._active_stream().update(r))
 
             def on_assistant_done(self, turn: Any) -> None:
-                if self._line_buffer:
-                    line = self._line_buffer
-                    self._line_buffer = ""
-                    self._flush_line(line)
-                elif not self._current_delta_parts and getattr(turn, "content", None):
-                    self._flush_line(str(turn.content))
+                # 1. Clear active stream widget
+                outer._ui(lambda: outer._active_stream().update(""))
 
-                if self._current_delta_parts or getattr(turn, "content", None):
+                # 2. Streamed or fallback reasoning (dedicated field)
+                reasoning_str = "".join(self._reason_parts)
+                if not reasoning_str and getattr(turn, "reasoning", None):
+                    reasoning_str = str(turn.reasoning)
+
+                if reasoning_str:
+                    for line in reasoning_str.split("\n"):
+                        outer._ui(lambda l=line: outer._chat().write(Text(l, style=THINKING_STYLE)))
+
+                # 3. Streamed or fallback content
+                content_str = "".join(self._current_delta_parts)
+                if not content_str and getattr(turn, "content", None):
+                    content_str = str(turn.content)
+
+                if content_str:
+                    rendered = _parse_thinking_text(content_str, {"in_think": False, "in_bracket": False})
+                    outer._ui(lambda r=rendered: outer._chat().write(r))
+
+                if reasoning_str or content_str:
                     outer._ui(lambda: outer._chat().write(Text("")))
+
                 self._current_delta_parts.clear()
+                self._reason_parts.clear()
                 self._think_state = {"in_think": False, "in_bracket": False}
+                self._saw_reasoning = False
 
             def on_tool_start(self, name: str, args: dict) -> None:
                 line = Text(f">> {name} {_compact_json(args)}", style="dim cyan")
@@ -333,6 +378,7 @@ class ChatApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield RichLog(id="chat", markup=False, highlight=False, wrap=True)
+        yield Static("", id="active-stream")
         yield Static("", id="status")
         yield Input(placeholder="> Type a prompt or /help...", id="input")
 
@@ -347,6 +393,9 @@ class ChatApp(App[None]):
 
     def _chat(self) -> RichLog:
         return self.query_one("#chat", RichLog)
+
+    def _active_stream(self) -> Static:
+        return self.query_one("#active-stream", Static)
 
     def _status(self) -> Static:
         return self.query_one("#status", Static)
@@ -375,6 +424,7 @@ class ChatApp(App[None]):
 
     def action_clear_log(self) -> None:
         self._chat().clear()
+        self._active_stream().update("")
 
     def action_reset_agent(self) -> None:
         if hasattr(self.agent, "reset"):

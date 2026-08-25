@@ -20,6 +20,7 @@ class AssistantTurn:
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
+    reasoning: str | None = None
 
 
 class LLMError(Exception):
@@ -35,7 +36,10 @@ class LLMClient:
 
     def chat_stream(self, messages: list[dict], tools_schema: list[dict] | None = None,
                     cancel=None):
-        """Yield {"type": "delta", "text": ...} chunks then {"type": "final", "turn": ...}.
+        """Yield {"type": "delta"|"reasoning", "text": ...} chunks then
+        {"type": "final", "turn": ...}. Reasoning deltas come from the
+        ``reasoning``/``reasoning_content`` fields some runtimes use for
+        thinking models.
 
         ``cancel`` is a threading.Event (or anything with ``is_set()``); when set
         mid-stream the response is closed and a final turn with whatever was
@@ -50,6 +54,7 @@ class LLMClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         pending: dict[int, dict] = {}  # tool_call index -> {id, name, arguments}
         finish_reason: str | None = None
 
@@ -84,6 +89,11 @@ class LLMClient:
                             continue
                         choice = choices[0]
                         delta = choice.get("delta") or {}
+                        thought = (delta.get("reasoning")
+                                   or delta.get("reasoning_content"))
+                        if thought:
+                            reasoning_parts.append(thought)
+                            yield {"type": "reasoning", "text": thought}
                         text = delta.get("content")
                         if text:
                             content_parts.append(text)
@@ -112,6 +122,11 @@ class LLMClient:
                             message = choice.get("message") or {}
                         except (json.JSONDecodeError, AttributeError) as exc:
                             raise LLMError(f"invalid non-streaming response: {exc}") from exc
+                        thought = (message.get("reasoning")
+                                   or message.get("reasoning_content"))
+                        if thought:
+                            reasoning_parts.append(thought)
+                            yield {"type": "reasoning", "text": thought}
                         text = message.get("content")
                         if text:
                             content_parts.append(text)
@@ -141,5 +156,6 @@ class LLMClient:
                                        name=slot["name"], arguments=args))
 
         turn = AssistantTurn(content="".join(content_parts) or None,
-                             tool_calls=tool_calls, finish_reason=finish_reason)
+                             tool_calls=tool_calls, finish_reason=finish_reason,
+                             reasoning="".join(reasoning_parts) or None)
         yield {"type": "final", "turn": turn}

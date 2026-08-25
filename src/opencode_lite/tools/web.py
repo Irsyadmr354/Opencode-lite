@@ -56,7 +56,10 @@ def webfetch_tool(workspace: pathlib.Path, config) -> Tool:
             except Exception:  # noqa: BLE001 - tolerate odd response objects
                 pass
             if "html" in content_type.lower():
-                text = BeautifulSoup(text, "html.parser").get_text("\n")
+                soup = BeautifulSoup(text, "html.parser")
+                for tag in soup(["script", "style", "noscript", "svg"]):
+                    tag.decompose()
+                text = soup.get_text("\n")
                 text = re.sub(r"[ \t]+\n", "\n", text)
                 text = re.sub(r"\n{3,}", "\n\n", text).strip()
             if len(text) > max_chars:
