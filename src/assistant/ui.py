@@ -407,8 +407,9 @@ class TerminalHooks(Hooks):
         if self._header_active:
             return
         frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+        dots = "." * ((self._spinner_idx % 3) + 1)
         self._spinner_idx += 1
-        self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}")
+        self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{dots}{ANSI_RESET}")
         self._header_active = True
         self._thinking_text = ""
 
@@ -416,19 +417,20 @@ class TerminalHooks(Hooks):
         if self._spinner_frozen or not self._header_active:
             return
         frame = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+        dots = "." * ((self._spinner_idx % 3) + 1)
         self._spinner_idx += 1
         preview = self._thinking_text.replace("\n", " ").strip()
         cols = shutil.get_terminal_size().columns
         if cols <= 0:
             cols = 80
-        # header "⠋ Thinking: " ~ 12 chars + preview
-        max_preview = max(0, cols - 22)
+        # header "⠋ Thinking...: " ~ 14 chars + preview
+        max_preview = max(0, cols - 24)
         if preview and max_preview:
             if len(preview) > max_preview:
                 preview = "…" + preview[-(max_preview-1):]
-            self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking: {preview}{ANSI_RESET}")
+            self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{dots}: {preview}{ANSI_RESET}")
         else:
-            self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{ANSI_RESET}")
+            self._write_stdout(f"\r\033[2K{ANSI_THINKING}{frame} Thinking{dots}{ANSI_RESET}")
 
     def _collapse_thinking(self, keep_header: bool = True) -> None:
         if not self._header_active:
