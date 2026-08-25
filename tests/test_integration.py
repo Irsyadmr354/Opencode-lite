@@ -461,17 +461,18 @@ def test_strip_roleplay_asterisks_preserves_bold_and_bullets():
     bullet_list = "* item 1\n* item 2\n* item 3"
     assert ui_mod.clean_roleplay_asterisks(bullet_list) == bullet_list
 
-    # Streaming preservation of bold and bullet in TerminalHooks
+    # Pure terminal streaming strips markdown asterisks cleanly
     out_bold = io.StringIO()
     hooks_bold = ui_mod.TerminalHooks(stdout=out_bold)
     hooks_bold.on_delta("**Important:** Do not delete files.")
     hooks_bold.on_assistant_done(SimpleNamespace(content="**Important:** Do not delete files."))
-    assert "**Important:** Do not delete files." in out_bold.getvalue()
+    assert "Important: Do not delete files." in out_bold.getvalue()
+    assert "**" not in out_bold.getvalue()
 
     out_bullet = io.StringIO()
     hooks_bullet = ui_mod.TerminalHooks(stdout=out_bullet)
     hooks_bullet.on_delta("* First bullet\n* Second bullet")
     hooks_bullet.on_assistant_done(SimpleNamespace(content="* First bullet\n* Second bullet"))
-    assert "* First bullet\n* Second bullet" in out_bullet.getvalue()
+    assert "- First bullet\n- Second bullet" in out_bullet.getvalue()
 
 
