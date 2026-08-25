@@ -150,9 +150,29 @@ class Agent:
         return {"role": "tool", "tool_call_id": call.id, "content": output}
 
     def _prune_context(self, max_tokens: int = 32000) -> None:
-        """Prune older conversation turns if context exceeds token budget, keeping system prompt."""
+        """Prune oldest conversation units when over the token budget.
+
+        A removable UNIT is either a single non-tool message, or an assistant
+        message carrying tool_calls together with ALL immediately-following
+        contiguous ``role:"tool"`` results — so pruning can never orphan a
+        tool message (OpenAI-compatible servers reject those with HTTP 400).
+        The system prompt (index 0) and the newest user turn are never
+        removed.
+        """
         while len(self.messages) > 2 and self._approx_tokens() > max_tokens:
-            self.messages.pop(1)
+            newest_user = 0
+            for idx, message in enumerate(self.messages):
+                if message.get("role") == "user":
+                    newest_user = idx
+            if newest_user <= 1:
+                break  # only the newest user turn remains; nothing safely prunable
+            end = 2
+            head = self.messages[1]
+            if head.get("role") == "assistant" and head.get("tool_calls"):
+                while (end < len(self.messages)
+                       and self.messages[end].get("role") == "tool"):
+                    end += 1
+            del self.messages[1:end]
 
     # -- public API ----------------------------------------------------------
 

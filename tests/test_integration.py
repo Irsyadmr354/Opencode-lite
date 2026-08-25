@@ -165,7 +165,8 @@ def test_terminal_hooks_thinking_tags_ansi_color():
 
     output = out.getvalue()
     assert ui_mod.ANSI_THINKING in output
-    assert "Thinking..." in output
+    assert ui_mod.SPINNER_FRAMES[0] + " Thinking" in output
+    assert "pondering deeply" in output  # reasoning text streams live
     assert "Here is the answer." in output
 
 

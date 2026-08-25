@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 
 import httpx
@@ -25,6 +26,35 @@ class AssistantTurn:
 
 class LLMError(Exception):
     """Raised on connection or HTTP failures."""
+
+
+# Inline "thinking" markup some models emit inside ``content`` when the
+# runtime does not populate a native reasoning field: closed <think> blocks,
+# a trailing unclosed <think> opener, and [thinking: ...] bracket blocks.
+_THINK_CLOSED_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+_THINK_UNCLOSED_RE = re.compile(r"<think>(.*)\Z", re.IGNORECASE | re.DOTALL)
+_BRACKET_THINKING_RE = re.compile(r"\[\s*thinking\s*:?\s*([^\]]*)\]", re.IGNORECASE)
+
+
+def _separate_inline_thinking(text: str) -> tuple[str, str]:
+    """Split model ``content`` into ``(visible_text, inline_thoughts)``.
+
+    Removes (a) ``<think>...</think>`` blocks, (b) an unclosed trailing
+    ``<think>`` opener plus everything after it (that text IS thinking),
+    and (c) ``[thinking: ...]`` blocks up to their closing ``]``. The
+    removed text is returned so it can be surfaced as reasoning instead of
+    being replayed into conversation history.
+    """
+    thoughts: list[str] = []
+
+    def _take(match: re.Match) -> str:
+        thoughts.append(match.group(1))
+        return ""
+
+    clean = _THINK_CLOSED_RE.sub(_take, text)
+    clean = _THINK_UNCLOSED_RE.sub(_take, clean)
+    clean = _BRACKET_THINKING_RE.sub(_take, clean)
+    return clean, "".join(thoughts)
 
 
 class LLMClient:
@@ -159,7 +189,6 @@ class LLMClient:
         raw_content = "".join(content_parts)
         if not tool_calls and raw_content:
             # 1. Check for XML tags <tool_call>...</tool_call>
-            import re
             for m in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", raw_content, re.DOTALL):
                 try:
                     obj = json.loads(m.group(1).strip())
@@ -197,7 +226,17 @@ class LLMClient:
                     except Exception:
                         pass
 
-        turn = AssistantTurn(content=raw_content or None,
-                             tool_calls=tool_calls, finish_reason=finish_reason,
-                             reasoning="".join(reasoning_parts) or None)
+        # Store CLEANED content: inline think markup was extracted from the
+        # RAW content above (tool-call fallback) and must not be replayed
+        # into conversation history. Surface it as reasoning only when the
+        # native reasoning field stayed empty; otherwise discard it.
+        clean_content, inline_thoughts = _separate_inline_thinking(raw_content)
+        reasoning_text = "".join(reasoning_parts) or None
+        if reasoning_text is None and inline_thoughts.strip():
+            reasoning_text = inline_thoughts
+
+        turn = AssistantTurn(
+            content=clean_content if clean_content.strip() else None,
+            tool_calls=tool_calls, finish_reason=finish_reason,
+            reasoning=reasoning_text)
         yield {"type": "final", "turn": turn}

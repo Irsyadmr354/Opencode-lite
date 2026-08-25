@@ -100,6 +100,7 @@ def harness():
         cfg = Config(max_tool_rounds=max_tool_rounds)
         return Agent(client=client, tools=list(tools), config=cfg, hooks=hooks)
 
+    make.servers = servers  # expose for client-received payload inspection
     yield make
     for srv in servers:
         srv.shutdown()
@@ -225,17 +226,127 @@ def test_llm_error_cleans_unfulfilled_user_message(harness):
     assert [m["role"] for m in agent.messages] == ["system"]
 
 
+# --- context pruning (exercised end-to-end through submit) ---------------------
+
+def _assert_api_valid_shape(messages: list[dict]) -> None:
+    """No role:'tool' message may lack its assistant(tool_calls) parent."""
+    for i, message in enumerate(messages):
+        if message.get("role") == "tool":
+            prev = messages[i - 1] if i else None
+            assert (prev is not None and prev.get("role") == "assistant"
+                    and prev.get("tool_calls")), f"orphaned tool message at index {i}"
+
+
 def test_context_pruning(harness):
-    agent = harness([])
-    # Fill with messages
+    hooks = RecordingHooks()
+    agent = harness([CONTENT_REPLY], hooks=hooks)
     agent.messages = [{"role": "system", "content": "system"}]
-    for i in range(100):
-        agent.messages.append({"role": "user", "content": "x" * 2000})
-        agent.messages.append({"role": "assistant", "content": "y" * 2000})
+    for i in range(40):
+        agent.messages.append({"role": "user", "content": f"OLD_USER_{i} " + "x" * 2000})
+        agent.messages.append({"role": "assistant", "content": f"OLD_ASSIST_{i} " + "y" * 2000})
     assert agent._approx_tokens() > 32000
-    agent._prune_context(max_tokens=5000)
+
+    agent.submit("fresh question")
+
+    assert agent.messages[0] == {"role": "system", "content": "system"}
+    _assert_api_valid_shape(agent.messages)
+    assert agent._approx_tokens() <= 33000, "history must be pruned to the budget"
+    flat = json.dumps(agent.messages)
+    assert "OLD_USER_0" not in flat and "OLD_ASSIST_0" not in flat, "oldest turns pruned"
+    assert "fresh question" in flat, "newest user turn must survive"
+    assert agent.messages[-2] == {"role": "user", "content": "fresh question"}
+    assert agent.messages[-1]["content"] == "Hello from the fake model."
+    assert hooks.errors == []
+
+
+def test_pruning_keeps_tool_pair_atomic(harness):
+    """Pruning must remove assistant(tool_calls)+tool results as ONE unit so
+    no orphaned tool message ever reaches an OpenAI-compatible server."""
+    echo = StubTool(name="echo")
+    hooks = RecordingHooks()
+    agent = harness([CONTENT_REPLY], tools=[echo], hooks=hooks)
+    pad = json.dumps({"pad": "P" * 30000})
+    agent.messages = [
+        {"role": "system", "content": "system"},
+        {"role": "assistant",
+         "content": None,
+         "tool_calls": [{"id": "call_old", "type": "function",
+                         "function": {"name": "echo", "arguments": pad}}]},
+        {"role": "tool", "tool_call_id": "call_old", "content": "R" * 30000},
+    ]
+    for i in range(12):
+        agent.messages.append({"role": "user", "content": f"FILLER_U_{i} " + "f" * 4000})
+        agent.messages.append({"role": "assistant", "content": f"FILLER_A_{i} " + "g" * 4000})
+    assert agent._approx_tokens() > 32000
+
+    agent.submit("and now?")
+
+    _assert_api_valid_shape(agent.messages)
+    flat = json.dumps(agent.messages)
+    assert '"call_old"' not in flat and '"RRR' not in flat, \
+        "assistant(tool_calls) and its tool result must vanish atomically"
+    assert agent._approx_tokens() <= 34000, "pruning must have run to the budget"
     assert agent.messages[0]["role"] == "system"
-    assert agent._approx_tokens() <= 5000
+    assert agent.messages[-2] == {"role": "user", "content": "and now?"}
+    assert agent.messages[-1]["content"] == "Hello from the fake model."
+    assert echo.calls == [], "scripted reply only; no tool may fire during submit"
+    assert hooks.errors == []
+
+
+# --- inline <think> stripping from stored history -------------------------------
+
+@pytest.mark.parametrize("raw,expected_content,expected_reasoning", [
+    ("<think>secret</think>answer", "answer", "secret"),
+    ("A<think>x</think>B", "AB", "x"),
+    ("<think>leaked tail", None, "leaked tail"),          # unclosed trailing opener
+    ("[thinking: quick look]Ready.", "Ready.", "quick look"),
+    ("<THINK>case</THINK>ok", "ok", "case"),
+    ("just text", "just text", None),
+])
+def test_inline_thinking_split(harness, raw, expected_content, expected_reasoning):
+    hooks = RecordingHooks()
+    agent = harness([{"content": raw, "finish_reason": "stop"}], hooks=hooks)
+
+    agent.submit("go")
+
+    turn = hooks.turns[0]
+    assert turn.content == expected_content
+    assert turn.reasoning == expected_reasoning
+    assert agent.messages[-1].get("content") == expected_content
+    assert "<think>" not in json.dumps(agent.messages)
+
+
+def test_think_tags_stripped_from_replayed_history(harness):
+    hooks = RecordingHooks()
+    think_reply = {"content": "<think>secret plan</think>The answer is 42.",
+                   "finish_reason": "stop"}
+    agent = harness([think_reply, CONTENT_REPLY], hooks=hooks)
+
+    agent.submit("question one")
+    agent.submit("question two")
+
+    # Round 2 request payload as received by the fake server
+    replay = harness.servers[-1].last_request["messages"]
+    assert hooks.turns[0].content == "The answer is 42."
+    assert hooks.turns[0].reasoning == "secret plan"
+    assert agent.messages[2]["content"] == "The answer is 42."
+    assert "<think>" not in json.dumps(replay), "clean history must be replayed"
+    assert "secret plan" not in json.dumps(replay)
+    assert hooks.errors == []
+
+
+def test_native_reasoning_field_wins_over_inline_think(harness):
+    hooks = RecordingHooks()
+    agent = harness([{"reasoning": "native thought",
+                      "content": "<think>junk</think>final",
+                      "finish_reason": "stop"}], hooks=hooks)
+
+    agent.submit("go")
+
+    assert hooks.turns[0].reasoning == "native thought"
+    assert hooks.turns[0].content == "final"
+    assert "junk" not in json.dumps(agent.messages), \
+        "inline think text discarded when native reasoning exists"
 
 
 # --- llm client -----------------------------------------------------------------
