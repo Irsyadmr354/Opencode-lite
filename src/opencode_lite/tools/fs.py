@@ -1,0 +1,253 @@
+"""Filesystem tools: read_file, write_file, delete_file, list_files.
+
+Every path argument is resolved against ``workspace.resolve()``; anything that
+escapes the workspace root is rejected with ``ERROR: path outside workspace``.
+All tool bodies are wrapped in try/except — a Tool.fn never raises.
+"""
+from __future__ import annotations
+
+import os
+import pathlib
+from typing import Callable, Iterable
+
+from opencode_lite.tools import Tool, ToolResult
+
+_EXCLUDED_PARTS = {".git", "__pycache__", "node_modules", ".venv", ".pytest_cache"}
+
+_MISSING = "ERROR: missing argument '{}'"
+_OUTSIDE = "ERROR: path outside workspace"
+
+
+def _resolve_in_workspace(
+    workspace: pathlib.Path, raw: str
+) -> tuple[pathlib.Path | None, pathlib.Path | None]:
+    """Resolve *raw* against the workspace; return (ws, target) or (None, None)."""
+    ws = workspace.resolve()
+    candidate = (ws / str(raw)).resolve()
+    if not candidate.is_relative_to(ws):
+        return None, None
+    return ws, candidate
+
+
+def _is_excluded(parts: Iterable[str]) -> bool:
+    for part in parts:
+        if part in _EXCLUDED_PARTS or part.endswith(".egg-info"):
+            return True
+    return False
+
+
+# --- read_file ---------------------------------------------------------------
+def read_file_tool(workspace: pathlib.Path, config) -> Tool:
+    max_lines = int(config.limits.read_max_lines)
+
+    def fn(args: dict) -> ToolResult:
+        try:
+            raw = args.get("path")
+            if raw is None:
+                return ToolResult(False, _MISSING.format("path"))
+            ws, target = _resolve_in_workspace(workspace, raw)
+            if target is None:
+                return ToolResult(False, _OUTSIDE)
+            if not target.is_file():
+                return ToolResult(False, f"ERROR: not a file: {raw}")
+            try:
+                start_line = int(args.get("start_line") or 1)
+            except (TypeError, ValueError):
+                start_line = 1
+            start_line = max(start_line, 1)
+
+            text = target.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+            if not lines:
+                return ToolResult(True, "(empty file)")
+            selected = lines[start_line - 1 : start_line - 1 + max_lines]
+            if not selected:
+                return ToolResult(
+                    False,
+                    f"ERROR: start_line {start_line} beyond end of file ({len(lines)} lines)",
+                )
+            end = start_line + len(selected) - 1
+            body = "\n".join(
+                f"{n:5d}: {lines[n - 1]}" for n in range(start_line, end + 1)
+            )
+            header = f"L{start_line}-L{end} of {len(lines)} lines"
+            return ToolResult(True, f"{header}\n{body}")
+        except Exception as exc:  # noqa: BLE001 - tool boundary must never raise
+            return ToolResult(False, f"ERROR: {exc}")
+
+    return Tool(
+        name="read_file",
+        description="Read a text file from the workspace with numbered lines.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to the workspace root.",
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-based first line to read (default 1).",
+                },
+            },
+            "required": ["path"],
+        },
+        danger=False,
+        fn=fn,
+    )
+
+
+# --- write_file --------------------------------------------------------------
+def write_file_tool(workspace: pathlib.Path, config) -> Tool:
+    def fn(args: dict) -> ToolResult:
+        try:
+            raw = args.get("path")
+            if raw is None:
+                return ToolResult(False, _MISSING.format("path"))
+            content = args.get("content")
+            if content is None:
+                return ToolResult(False, _MISSING.format("content"))
+            ws, target = _resolve_in_workspace(workspace, raw)
+            if target is None:
+                return ToolResult(False, _OUTSIDE)
+            data = str(content).encode("utf-8")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)  # exact utf-8 bytes, no newline translation
+            rel = target.relative_to(ws).as_posix()
+            return ToolResult(True, f"OK: wrote {len(data)} bytes to {rel}")
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(False, f"ERROR: {exc}")
+
+    return Tool(
+        name="write_file",
+        description="Create or overwrite a file in the workspace with utf-8 content.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to the workspace root.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full new content of the file.",
+                },
+            },
+            "required": ["path", "content"],
+        },
+        danger=False,
+        fn=fn,
+    )
+
+
+# --- delete_file -------------------------------------------------------------
+def delete_file_tool(workspace: pathlib.Path, config) -> Tool:
+    def fn(args: dict) -> ToolResult:
+        try:
+            raw = args.get("path")
+            if raw is None:
+                return ToolResult(False, _MISSING.format("path"))
+            ws, target = _resolve_in_workspace(workspace, raw)
+            if target is None:
+                return ToolResult(False, _OUTSIDE)
+            if not target.exists():
+                return ToolResult(False, f"ERROR: not found: {raw}")
+            if target.is_dir():
+                return ToolResult(
+                    False,
+                    f"ERROR: '{raw}' is a directory; use the shell tool instead "
+                    "(e.g. Remove-Item -Recurse on Windows)",
+                )
+            os.remove(target)
+            rel = target.relative_to(ws).as_posix()
+            return ToolResult(True, f"OK: deleted {rel}")
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(False, f"ERROR: {exc}")
+
+    return Tool(
+        name="delete_file",
+        description="Permanently delete a single file inside the workspace.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to the workspace root.",
+                }
+            },
+            "required": ["path"],
+        },
+        danger=True,
+        fn=fn,
+    )
+
+
+# --- list_files --------------------------------------------------------------
+def list_files_tool(workspace: pathlib.Path, config) -> Tool:
+    max_entries = int(config.limits.list_max_entries)
+
+    def fn(args: dict) -> ToolResult:
+        try:
+            raw = args.get("path") or "."
+            pattern = args.get("pattern") or "**/*"
+            ws, base = _resolve_in_workspace(workspace, raw)
+            if base is None:
+                return ToolResult(False, _OUTSIDE)
+            if not base.is_dir():
+                return ToolResult(False, f"ERROR: not a directory: {raw}")
+
+            matches = [p for p in sorted(base.glob(str(pattern)))
+                       if not _is_excluded(p.relative_to(base).parts)]
+            matches.sort(
+                key=lambda p: (
+                    0 if p.is_dir() else 1,
+                    p.relative_to(ws).as_posix().lower(),
+                )
+            )
+
+            shown = matches[:max_entries]
+            lines = [
+                p.relative_to(ws).as_posix() + ("/" if p.is_dir() else "")
+                for p in shown
+            ]
+            output = "\n".join(lines)
+            hidden = len(matches) - len(shown)
+            if hidden > 0:
+                output += f"\n... and {hidden} more"
+            if not output:
+                output = "(no matching entries)"
+            return ToolResult(True, output)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(False, f"ERROR: {exc}")
+
+    return Tool(
+        name="list_files",
+        description="List files/dirs under a workspace folder using glob patterns.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory to search, relative to the "
+                    "workspace root (default '.').",
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern relative to 'path' "
+                    "(default '**/*').",
+                },
+            },
+            "required": [],
+        },
+        danger=False,
+        fn=fn,
+    )
+
+
+def build_tools(workspace: pathlib.Path, config) -> list[Tool]:
+    return [
+        read_file_tool(workspace, config),
+        write_file_tool(workspace, config),
+        list_files_tool(workspace, config),
+        delete_file_tool(workspace, config),
+    ]

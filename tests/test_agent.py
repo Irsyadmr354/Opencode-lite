@@ -1,0 +1,278 @@
+"""Offline tests: agent loop, LLM streaming client, config loading."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent
+for _p in (str(_ROOT / "src"), str(_HERE)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from fake_ollama import FakeOllama  # noqa: E402
+
+from opencode_lite.agent import SYSTEM_PROMPT, Agent, Hooks  # noqa: E402
+from opencode_lite.config import Config, load_config  # noqa: E402
+from opencode_lite.llm import LLMClient, LLMError  # noqa: E402
+
+
+# --- helpers -----------------------------------------------------------------
+
+class StubTool:
+    """Duck-typed tool recording calls; returns ok/output like the real ones."""
+
+    def __init__(self, name: str = "echo", danger: bool = False, raises: bool = False):
+        self.name = name
+        self.description = "stub tool for tests"
+        self.parameters = {"type": "object", "properties": {}, "required": []}
+        self.danger = danger
+        self.raises = raises
+        self.calls: list[dict] = []
+
+    def fn(self, args: dict) -> dict:
+        self.calls.append(dict(args))
+        if self.raises:
+            raise RuntimeError("boom")
+        return {"ok": True, "output": "ran:" + json.dumps(args, sort_keys=True)}
+
+
+class RecordingHooks(Hooks):
+    def __init__(self, allow: bool = True):
+        super().__init__()
+        self.allow = allow
+        self.deltas: list[str] = []
+        self.turns: list = []
+        self.statuses: list[dict] = []
+        self.errors: list[str] = []
+        self.permission_requests: list[tuple[str, dict]] = []
+        self.cancel_after_done = 0  # >0: cancel agent after N assistant turns
+        self.agent_ref: dict = {}
+
+    def on_delta(self, text: str) -> None:
+        self.deltas.append(text)
+
+    def on_assistant_done(self, turn) -> None:
+        self.turns.append(turn)
+        if self.cancel_after_done and len(self.turns) >= self.cancel_after_done:
+            self.agent_ref["agent"].cancelled = True
+
+    def on_permission(self, name: str, args: dict) -> bool:
+        self.permission_requests.append((name, dict(args)))
+        return self.allow
+
+    def on_status(self, info: dict) -> None:
+        self.statuses.append(dict(info))
+
+    def on_error(self, msg: str) -> None:
+        self.errors.append(msg)
+
+
+CONTENT_REPLY = {"content": "Hello from the fake model.", "finish_reason": "stop"}
+
+
+def tool_call_reply(name: str, args: dict | None = None, call_id: str = "call_42") -> dict:
+    return {
+        "content": None,
+        "tool_calls": [{
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args or {})},
+        }],
+        "finish_reason": "tool_calls",
+    }
+
+
+@pytest.fixture
+def harness():
+    servers: list[FakeOllama] = []
+
+    def make(script, tools=(), hooks=None, max_tool_rounds: int = 25) -> Agent:
+        srv = FakeOllama(script)
+        srv.start()
+        servers.append(srv)
+        client = LLMClient(base_url=srv.base_url, api_key="ollama",
+                           model="fake-model", timeout_s=10)
+        cfg = Config(max_tool_rounds=max_tool_rounds)
+        return Agent(client=client, tools=list(tools), config=cfg, hooks=hooks)
+
+    yield make
+    for srv in servers:
+        srv.shutdown()
+
+
+# --- agent loop ---------------------------------------------------------------
+
+def test_plain_reply(harness):
+    hooks = RecordingHooks()
+    agent = harness([CONTENT_REPLY], hooks=hooks)
+
+    agent.submit("hi there")
+
+    assert [m["role"] for m in agent.messages] == ["system", "user", "assistant"]
+    assert agent.messages[1] == {"role": "user", "content": "hi there"}
+    assert agent.messages[2]["content"] == "Hello from the fake model."
+    assert "tool_calls" not in agent.messages[2]
+    assert "".join(hooks.deltas) == "Hello from the fake model."
+    assert len(hooks.deltas) >= 2, "deltas must arrive incrementally (>=2 chunks)"
+    assert len(hooks.turns) == 1
+    assert hooks.turns[0].finish_reason == "stop"
+    assert hooks.errors == []
+
+
+def test_tool_roundtrip(harness):
+    echo = StubTool(name="echo")
+    hooks = RecordingHooks()
+    agent = harness([tool_call_reply("echo", {"msg": "ping"}), CONTENT_REPLY],
+                    tools=[echo], hooks=hooks)
+
+    agent.submit("please echo")
+
+    assert echo.calls == [{"msg": "ping"}], "fn must receive parsed args dict"
+    assistants = [m for m in agent.messages if m["role"] == "assistant"]
+    assert len(assistants) == 2
+    assert assistants[0]["tool_calls"][0]["id"] == "call_42"
+    assert json.loads(assistants[0]["tool_calls"][0]["function"]["arguments"]) == {"msg": "ping"}
+    assert assistants[1]["content"] == "Hello from the fake model."
+    assert assistants[1].get("tool_calls") is None and "tool_calls" not in assistants[1]
+    tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["tool_call_id"] == "call_42"
+    assert "ping" in tool_msgs[0]["content"]
+    assert hooks.errors == []
+
+
+def test_danger_denied(harness):
+    guard = StubTool(name="guard", danger=True)
+    hooks = RecordingHooks(allow=False)
+    agent = harness([tool_call_reply("guard", {"path": "x.txt"}), CONTENT_REPLY],
+                    tools=[guard], hooks=hooks)
+
+    agent.submit("delete stuff")
+
+    tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["content"] == "DENIED by user"
+    assert guard.calls == [], "denied tools must not execute"
+    assert hooks.permission_requests == [("guard", {"path": "x.txt"})]
+    assert hooks.turns[-1].content == "Hello from the fake model."  # loop continued
+    assert hooks.errors == []
+
+
+def test_unknown_tool(harness):
+    hooks = RecordingHooks()
+    agent = harness([tool_call_reply("nope", {"a": 1}), CONTENT_REPLY],
+                    tools=[], hooks=hooks)
+
+    agent.submit("do it")
+
+    tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+    assert len(tool_msgs) == 1
+    assert "unknown tool" in tool_msgs[0]["content"]
+    assert hooks.errors == []
+
+
+def test_cancel(harness):
+    hooks = RecordingHooks()
+    hooks.cancel_after_done = 1
+    # single entry repeats forever -> infinite tool-calling script
+    agent = harness([tool_call_reply("echo", {"n": 1})],
+                    tools=[StubTool(name="echo")], hooks=hooks,
+                    max_tool_rounds=50)
+    hooks.agent_ref["agent"] = agent
+
+    agent.submit("loop forever")  # must return without raising or error spam
+
+    assert agent.cancelled is True
+    assert len(hooks.turns) == 1, "loop must stop right after round 1"
+    assistants = [m for m in agent.messages if m["role"] == "assistant"]
+    assert len(assistants) == 1
+    assert all(m["role"] != "tool" for m in agent.messages), "no tools ran post-cancel"
+    assert hooks.errors == [], "cancel must not trigger on_error"
+
+
+def test_tool_exception_becomes_error_message(harness):
+    broken = StubTool(name="broken", raises=True)
+    hooks = RecordingHooks()
+    agent = harness([tool_call_reply("broken", {}), CONTENT_REPLY],
+                    tools=[broken], hooks=hooks)
+
+    agent.submit("crash it")
+
+    tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+    assert tool_msgs[0]["content"].startswith("ERROR: ")
+    assert "boom" in tool_msgs[0]["content"]
+    assert hooks.errors == []
+
+
+def test_system_prompt_contract():
+    for name in ("read_file", "write_file", "delete_file", "list_files",
+                 "shell", "webfetch", "websearch"):
+        assert name in SYSTEM_PROMPT, f"SYSTEM_PROMPT must name {name}"
+    assert len(SYSTEM_PROMPT.split()) < 220
+
+
+# --- llm client -----------------------------------------------------------------
+
+def test_llm_error_on_unreachable_server():
+    srv = FakeOllama([])
+    _, port = srv.start()
+    srv.shutdown()
+    client = LLMClient(base_url=f"http://127.0.0.1:{port}/v1", api_key="k",
+                       model="m", timeout_s=5)
+    with pytest.raises(LLMError):
+        list(client.chat_stream([{"role": "user", "content": "hi"}]))
+
+
+def test_llm_error_on_http_status():
+    srv = FakeOllama([{"status": 500, "body": '{"error":"kaboom"}'}])
+    srv.start()
+    try:
+        client = LLMClient(base_url=srv.base_url, api_key="k", model="m", timeout_s=5)
+        with pytest.raises(LLMError) as excinfo:
+            list(client.chat_stream([{"role": "user", "content": "hi"}]))
+        assert "500" in str(excinfo.value)
+        assert "kaboom" in str(excinfo.value)
+    finally:
+        srv.shutdown()
+
+
+# --- config ----------------------------------------------------------------------
+
+def test_load_config_toml(tmp_path, monkeypatch):
+    monkeypatch.delenv("OCLITE_MODEL", raising=False)
+    monkeypatch.delenv("OCLITE_BASE_URL", raising=False)
+
+    cfg_file = tmp_path / "oclite.toml"
+    cfg_file.write_text(
+        'model = "llama3:8b"\n'
+        "max_tool_rounds = 7\n"
+        "\n[limits]\n"
+        "read_max_lines = 50\n"
+        "\n[permissions]\n"
+        'shell = "allow"\n',
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_file)
+    assert cfg.model == "llama3:8b"
+    assert cfg.max_tool_rounds == 7
+    assert cfg.limits.read_max_lines == 50
+    assert cfg.limits.shell_timeout_s == 120, "untouched limits keep defaults"
+    assert cfg.permissions.shell == "allow"
+    assert cfg.permissions.delete == "ask", "untouched permissions keep defaults"
+    assert cfg.workspace == Path.cwd()
+    assert cfg.stream is True
+
+    monkeypatch.setenv("OCLITE_MODEL", "env-model")
+    assert load_config(cfg_file).model == "env-model", "env overrides file"
+
+    overrides = {"model": "override-model"}
+    assert load_config(cfg_file, overrides).model == "override-model"
+
+    with pytest.raises(ValueError):
+        load_config(None, {"not_a_real_key": 1})
