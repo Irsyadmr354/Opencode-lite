@@ -32,7 +32,7 @@ class Permissions:
 
 @dataclass
 class Config:
-    model: str = "deepseek-r1-balanced"
+    model: str = "deepseek-r1-3b-balanced"
     base_url: str = "http://127.0.0.1:11434/v1"
     api_key: str = "ollama"
     workspace: pathlib.Path = field(default_factory=pathlib.Path.cwd)
