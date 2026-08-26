@@ -35,6 +35,7 @@ class Tool:
     parameters: dict
     danger: bool
     fn: Callable[[dict], ToolResult]
+    permission_key: str | None = None
 
 
 # --- imported after shared types so submodules can bind them -----------------

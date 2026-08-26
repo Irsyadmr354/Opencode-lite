@@ -9,7 +9,7 @@ from assistant.tools import Tool, ToolResult
 
 TOOL_SPEC = {
     "name": "get_current_time",
-    "description": "Get current date/time - MUST call before web_search to get newest update",
+    "description": "Get current date and time (ISO, UTC, local).",
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
@@ -41,6 +41,7 @@ def time_tool(workspace, config) -> Tool:
         parameters=TOOL_SPEC["parameters"],
         danger=False,
         fn=fn,
+        permission_key=None,
     )
 
 

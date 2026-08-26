@@ -77,23 +77,23 @@ def _compact_json(args: Any) -> str:
 def _format_args_summary(name: str, args: dict | Any) -> str:
     if not isinstance(args, dict):
         return str(args)
-    if name == "shell" and "command" in args:
+    if "command" in args:
         return str(args["command"])
-    if name in ("read_file", "delete_file") and "path" in args:
+    if "path" in args:
         start = args.get("start_line")
+        pattern = args.get("pattern")
         if start:
             return f"{args['path']}:{start}"
+        if pattern:
+            return f"{args['path']} [{pattern}]"
         return str(args["path"])
-    if name == "write_file" and "path" in args:
-        return str(args["path"])
-    if name == "list_files":
-        path = args.get("path", ".")
-        pattern = args.get("pattern")
-        return f"{path} [{pattern}]" if pattern else str(path)
-    if name == "webfetch" and "url" in args:
+    if "url" in args:
         return str(args["url"])
-    if name == "websearch" and "query" in args:
+    if "query" in args:
         return str(args["query"])
+    for v in args.values():
+        if isinstance(v, str) and len(v) < 60:
+            return v
     return _compact_json(args)
 
 
@@ -106,6 +106,27 @@ def _pretty_json(args: Any, max_lines: int = ARGS_PREVIEW_LINES) -> str:
     if len(lines) > max_lines:
         lines = lines[:max_lines] + [f"... (+{len(lines) - max_lines} more lines)"]
     return "\n".join(lines)
+
+
+_UI_TOOL_LEAK_RE = re.compile(r"<\/?tool_calls?>|>tool_calls?|\[\s*[a-zA-Z0-9_]+\s*(?:\(.*?\))?\s*\]", re.IGNORECASE)
+
+
+def _is_tool_json_display(s: str) -> bool:
+    if not s:
+        return False
+    if '"name"' in s and ('"arguments"' in s or '"path"' in s or '"query"' in s or '"command"' in s or '"content"' in s):
+        return True
+    if _UI_TOOL_LEAK_RE.search(s):
+        return True
+    t = s.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-z]*\s*\n?", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"\n?```\s*$", "", t).strip()
+    if t.startswith("{") and ('"name"' in t or '"function"' in t or '"tool"' in t):
+        return True
+    if "```json" in s and ('"name"' in s or _UI_TOOL_LEAK_RE.search(s)):
+        return True
+    return False
 
 
 def clean_roleplay_asterisks(text: str) -> str:
@@ -180,30 +201,6 @@ def _tag_holdback(buffer: str, in_think: bool, at_line_start: bool = False) -> i
     if not in_think and at_line_start and buffer == "*":
         return 1
     return 0
-
-
-def _is_tool_json_display(s: str) -> bool:
-    if not s:
-        return False
-    # aggressive: any leaked tool JSON or tool call syntax should be hidden
-    if '"name"' in s and '"arguments"' in s:
-        return True
-    if '"name"' in s and ('"path"' in s or '"query"' in s or '"command"' in s or '"content"' in s):
-        return True
-    lowered = s.lower()
-    if ">tool_call" in lowered or "<tool_call" in lowered or "</tool_call" in lowered:
-        return True
-    if any(kw in lowered for kw in ("[get_current_time", "[websearch", "[webfetch", "[read_file", "[write_file", "[delete_file", "[list_files", "[shell")):
-        return True
-    t = s.strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```[a-z]*\s*\n?", "", t, flags=re.IGNORECASE)
-        t = re.sub(r"\n?```\s*$", "", t).strip()
-    if t.startswith("{") and ('"name"' in t or '"function"' in t or '"tool"' in t):
-        return True
-    if "```json" in s and '"name"' in s:
-        return True
-    return False
 
 
 def _parse_thinking_text(text: str, state: dict[str, bool]):  # type: ignore[no-untyped-def]
@@ -821,10 +818,10 @@ class TerminalHooks(Hooks):
             err_text = preview or "failed"
             self._write_stdout(f" -> {ANSI_RED}ERROR: {err_text}{ANSI_RESET}\n")
 
-        # Show file preview for write_file (lightweight, no model cost)
-        if ok and name == "write_file" and self._current_args is not None:
+        # Show file preview when path & content are modified (lightweight, no model cost)
+        if ok and self._current_args is not None and isinstance(self._current_args, dict) and "path" in self._current_args and "content" in self._current_args:
             try:
-                pth = self._current_args.get("path") if isinstance(self._current_args, dict) else None
+                pth = self._current_args.get("path")
                 if pth:
                     base = self._workspace if self._workspace is not None else Path.cwd()
                     # Resolve safely inside workspace if possible

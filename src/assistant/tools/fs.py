@@ -111,7 +111,7 @@ def read_file_tool(workspace: pathlib.Path, config) -> Tool:
             if target is None:
                 return ToolResult(False, _OUTSIDE)
             if not target.is_file():
-                return ToolResult(False, f"ERROR: not a file: {raw} — hint: call list_files with path '.' to discover files first, never guess")
+                return ToolResult(False, f"ERROR: not a file: {raw}")
             size = target.stat().st_size
             if size > _MAX_READ_BYTES:
                 return ToolResult(
@@ -163,6 +163,7 @@ def read_file_tool(workspace: pathlib.Path, config) -> Tool:
         },
         danger=False,
         fn=fn,
+        permission_key=None,
     )
 
 
@@ -206,6 +207,7 @@ def write_file_tool(workspace: pathlib.Path, config) -> Tool:
         },
         danger=False,
         fn=fn,
+        permission_key="write",
     )
 
 
@@ -224,8 +226,7 @@ def delete_file_tool(workspace: pathlib.Path, config) -> Tool:
             if target.is_dir():
                 return ToolResult(
                     False,
-                    f"ERROR: '{raw}' is a directory; use the shell tool instead "
-                    "(e.g. Remove-Item -Recurse on Windows)",
+                    f"ERROR: '{raw}' is a directory",
                 )
             os.remove(target)
             rel = target.relative_to(ws).as_posix()
@@ -248,6 +249,7 @@ def delete_file_tool(workspace: pathlib.Path, config) -> Tool:
         },
         danger=True,
         fn=fn,
+        permission_key="delete",
     )
 
 
@@ -327,6 +329,7 @@ def list_files_tool(workspace: pathlib.Path, config) -> Tool:
         },
         danger=False,
         fn=fn,
+        permission_key=None,
     )
 
 

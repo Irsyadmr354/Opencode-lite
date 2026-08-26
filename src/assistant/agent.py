@@ -13,8 +13,8 @@ from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for t
 DEFAULT_SYSTEM_PROMPT = (
     "You are Assistant, coding agent in workspace. Tools: get_current_time, "
     "websearch, webfetch, read_file, write_file, delete_file, list_files, shell. "
-    "Never call tools for simple greetings (hi/hello). Only for news/search: "
-    "call get_current_time then websearch. Always list_files '.' before read, if vague list immediately. "
+    "Use tools only when needed. Match user language. "
+    "Always list_files '.' before read, if vague list immediately. "
     "Be concise, no intro/outro, >20 lines -> file, use tool_calls."
 )
 
@@ -39,87 +39,15 @@ def _resolve_identity(config: Config | None, default_ws: str | None = None) -> s
     return f"Assistant, coding agent in workspace {ws}."
 
 
-_HALU_RE = re.compile(
-    r"\b(anthropic|openai|gpt-4|gpt-3\.5|chatgpt|as an ai language model|i am an ai language model|i'm an ai language model|created by anthropic|created by openai|based on openai)\b",
-    re.IGNORECASE,
-)
-
-
-def _sanitize_turn_content(
-    content: str | None,
-    config: Config | None,
-    is_greeting: bool = False,
-    user_text: str = "",
-) -> str | None:
+def _sanitize_turn_content(content: str | None, config: Config | None = None) -> str | None:
     if not content or not isinstance(content, str):
-        if is_greeting:
-            u = user_text.lower()
-            if any(k in u for k in ("halo", "hai", "selamat", "pagi", "siang", "malam", "siapa", "apa")):
-                return "Halo! Ada yang bisa saya bantu di workspace ini?"
-            return "Hello! How can I assist you today?"
         return content
-    stripped = content.strip()
-    # Check for raw tool call leak in content
-    if (
-        stripped.startswith(">tool_call")
-        or stripped.startswith("<tool_call")
-        or ">tool_calls" in stripped
-        or re.match(r"^>tool_calls?\s*\[.*\]$", stripped)
-        or (stripped.startswith("[") and stripped.endswith("]") and "get_current_time" in stripped)
-    ):
-        if is_greeting:
-            u = user_text.lower()
-            if any(k in u for k in ("halo", "hai", "selamat", "pagi", "siang", "malam", "siapa", "apa")):
-                return "Halo! Ada yang bisa saya bantu di workspace ini?"
-            return "Hello! How can I assist you today?"
-        return ""
-    # Strip any inline >tool_calls or <tool_call>...</tool_call> fragments
+    # Strip any leaked raw tool call syntax markers from content
     cleaned = re.sub(r">tool_calls?\s*\[[^\]]*\]", "", content, flags=re.IGNORECASE)
     cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r"<\/?tool_calls?>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r">tool_calls?\s*\{.*?\}", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = cleaned.strip()
-
-    if not cleaned and is_greeting:
-        u = user_text.lower()
-        if any(k in u for k in ("halo", "hai", "selamat", "pagi", "siang", "malam", "siapa", "apa")):
-            return "Halo! Ada yang bisa saya bantu di workspace ini?"
-        return "Hello! How can I assist you today?"
-
-    if _HALU_RE.search(cleaned or content):
-        ws = str(config.workspace) if config and hasattr(config, "workspace") else "workspace"
-        ident = _resolve_identity(config, ws)
-        lowered = (cleaned or content).lower()
-        if any(k in lowered for k in ("saya", "adalah", "model", "bahasa", "dibuat", "oleh")):
-            return f"Assistant, coding agent di workspace {ws}. Bisa bantu baca/tulis/hapus file, list file, shell, dan websearch/webfetch."
-        return f"{ident} Capabilities: read/write/delete files, list files, shell commands, websearch/webfetch."
-    return cleaned if cleaned else content
-
-
-_GREETING_TOKENS = {"hi", "hello", "hey", "yo", "sup", "hiya", "howdy", "halo", "hai", "p"}
-
-
-def _is_simple_greeting(text: str) -> bool:
-    t = text.strip().lower().rstrip("!.,? \t\r\n")
-    if t in _GREETING_TOKENS:
-        return True
-    words = t.split()
-    if len(words) == 1 and words[0] in _GREETING_TOKENS:
-        return True
-    if len(words) == 2 and words[0] in _GREETING_TOKENS and words[1] in {"there", "bot", "assistant", "bro", "kawan", "teman"}:
-        return True
-    return False
-
-
-#: Maps tool names to their ``Config.permissions`` attribute. Tools absent
-#: here are governed purely by their ``danger`` flag (default policy: allow).
-_PERMISSION_KEY = {
-    "write_file": "write",
-    "delete_file": "delete",
-    "shell": "shell",
-    "webfetch": "webfetch",
-    "websearch": "websearch",
-}
+    return cleaned.strip()
 
 
 class Hooks:
@@ -138,86 +66,97 @@ class Hooks:
     def on_tool_result(self, name: str, res) -> None: ...
 
     def on_permission(self, name: str, args: dict) -> bool:
+        """Called when a tool requires confirmation; returns True if approved."""
         return False
 
     def on_status(self, info: dict) -> None: ...
 
-    def on_error(self, msg: str) -> None: ...
+    def on_error(self, message: str) -> None: ...
 
 
 class _CancelFlag:
-    """threading.Event-compatible read-only view of ``Agent.cancelled``.
+    """Read-only view of agent.cancelled passed into client.chat_stream."""
 
-    Lets another thread flip the plain bool attribute and have in-flight
-    streaming observe it via ``is_set()``.
-    """
-
-    __slots__ = ("_agent",)
-
-    def __init__(self, agent: "Agent") -> None:
+    def __init__(self, agent: Agent) -> None:
         self._agent = agent
 
     def is_set(self) -> bool:
-        return bool(self._agent.cancelled)
+        return self._agent.cancelled
 
 
 class Agent:
-    """Blocking tool-loop agent. Tools are duck-typed objects with
-    ``name/description/parameters/danger/fn``; ``fn(args)`` returns something
-    with ``ok`` bool and ``output`` str."""
-
-    def __init__(self, client: LLMClient, tools: list, config: Config,
+    def __init__(self, client: LLMClient, tools: list,
+                 config: Config | None = None,
                  hooks: Hooks | None = None) -> None:
         self.client = client
         self.tools = list(tools)
-        self.config = config
+        self.tools_by_name = {t.name: t for t in self.tools}
+        self.config = config if config is not None else Config()
         self.hooks = hooks if hooks is not None else Hooks()
-        self.tools_by_name = {tool.name: tool for tool in self.tools}
-        self.messages: list[dict] = [{"role": "system", "content": _resolve_system_prompt(config)}]
-        self.cancelled: bool = False
-
-    def reset(self) -> None:
-        self.messages = [{"role": "system", "content": _resolve_system_prompt(self.config)}]
         self.cancelled = False
+        sys_prompt = _resolve_system_prompt(self.config)
+        self.messages: list[dict] = [
+            {"role": "system", "content": sys_prompt}
+        ]
 
-    # -- session persistence -------------------------------------------------
+    # -- session management --------------------------------------------------
 
-    def save_session(self, name: str):
-        """Persist current conversation history to ``~/.assistant/sessions/<name>.json``."""
-        from . import session as _session  # lazy import to avoid circular
+    def save_session(self, name: str) -> Path:
+        """Save current conversation history to a session file."""
+        from . import session
+        return session.save_session(name, self.messages)
 
-        return _session.save_session(name, self.messages)
-
-    def load_session(self, name: str) -> None:
-        """Load conversation history from a saved session, replacing current messages."""
-        from . import session as _session  # lazy import to avoid circular
-
-        msgs = _session.load_session(name)
-        # Sanitize loaded messages (old files may have content=null)
-        for m in msgs:
-            if "content" not in m or m["content"] is None:
-                m["content"] = ""
-            elif not isinstance(m["content"], str):
-                m["content"] = str(m["content"])
-        self.messages = msgs
+    def load_session(self, name: str) -> list[dict]:
+        """Load conversation history from a named session file."""
+        from . import session
+        messages = session.load_session(name)
+        self.messages = messages
         self.cancelled = False
+        return list(self.messages)
 
     def new_session(self) -> None:
-        """Start a fresh session (alias for reset)."""
-        self.reset()
+        """Reset conversation history to a new session."""
+        self.reset_session()
+        self.cancelled = False
 
-    # -- internals -----------------------------------------------------------
+    def get_session_messages(self) -> list[dict]:
+        """Return the current conversation history (for saving)."""
+        return list(self.messages)
+
+    def load_session_messages(self, messages: list[dict]) -> None:
+        """Replace the current conversation history (from a loaded session).
+
+        Preserves the current system prompt if the loaded messages do not
+        contain one.
+        """
+        if not messages:
+            sys_prompt = _resolve_system_prompt(self.config)
+            self.messages = [{"role": "system", "content": sys_prompt}]
+            return
+        # Ensure system prompt is present as first message
+        if messages[0].get("role") != "system":
+            sys_prompt = _resolve_system_prompt(self.config)
+            self.messages = [{"role": "system", "content": sys_prompt}] + list(messages)
+        else:
+            self.messages = list(messages)
+
+    def reset_session(self) -> None:
+        """Clear conversation history, keeping only the system prompt."""
+        sys_prompt = _resolve_system_prompt(self.config)
+        self.messages = [{"role": "system", "content": sys_prompt}]
+
+    # -- tool / context helpers ----------------------------------------------
 
     def _tools_schema(self) -> list[dict]:
-        schema = []
-        for tool in self.tools:
+        schema: list[dict] = []
+        for t in self.tools:
             schema.append({
                 "type": "function",
                 "function": {
-                    "name": tool.name,
-                    "description": getattr(tool, "description", ""),
-                    "parameters": getattr(tool, "parameters",
-                                          {"type": "object", "properties": {}}),
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": (getattr(t, "parameters", None) or
+                                   {"type": "object", "properties": {}}),
                 },
             })
         return schema
@@ -234,20 +173,10 @@ class Agent:
 
     def _assistant_message(self, turn) -> dict:
         # Always set content as string - Ollama rejects null/missing content (Go <nil>)
-        content = (
-            _sanitize_turn_content(
-                turn.content,
-                self.config,
-                is_greeting=getattr(self, "_is_greeting", False),
-                user_text=getattr(self, "_last_user_text", ""),
-            )
-            if isinstance(turn.content, str)
-            else ""
-        )
+        content = _sanitize_turn_content(turn.content, self.config) if isinstance(turn.content, str) else ""
         # If model dumped tool JSON as content but also provided tool_calls, hide the JSON
         if turn.tool_calls and content:
             stripped = content.strip()
-            # strip fences for check
             fenced = re.sub(r"^```[a-z]*\s*\n?", "", stripped, flags=re.IGNORECASE)
             fenced = re.sub(r"\n?```\s*$", "", fenced).strip()
             if fenced.startswith("{") and '"name"' in fenced and '"arguments"' in fenced:
@@ -274,9 +203,11 @@ class Agent:
                 _timings.append({"name": call.name, "duration_s": 0.0, "ok": False})
             return {"role": "tool", "tool_call_id": call.id,
                     "content": f"ERROR: unknown tool '{call.name}'"}
-        perm_key = _PERMISSION_KEY.get(call.name)
-        perm = getattr(self.config.permissions, perm_key,
-                       "allow") if perm_key else "allow"
+        perm_key = getattr(tool, "permission_key", None)
+        if perm_key is not None and hasattr(self.config.permissions, perm_key):
+            perm = getattr(self.config.permissions, perm_key)
+        else:
+            perm = "ask" if tool.danger else "allow"
         if perm == "deny":
             if _timings is not None:
                 _timings.append({"name": call.name, "duration_s": 0.0, "ok": False})
@@ -294,7 +225,6 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - tool crashes become tool messages
             res = {"ok": False, "output": f"ERROR: {exc}"}
         duration = time.monotonic() - t0
-        # Determine ok for timing record
         if isinstance(res, dict):
             ok = bool(res.get("ok", True))
         else:
@@ -303,19 +233,17 @@ class Agent:
             _timings.append({"name": call.name, "duration_s": duration, "ok": ok})
         self.hooks.on_tool_result(call.name, res)
         if isinstance(res, dict):
-            output = str(res.get("output", ""))
+            body = res.get("output", "")
         else:
-            output = str(res)
-        return {"role": "tool", "tool_call_id": call.id, "content": output}
+            body = getattr(res, "output", "")
+        return {"role": "tool", "tool_call_id": call.id, "content": str(body)}
 
     def _prune_context(self, max_tokens: int | None = None) -> None:
-        """Prune oldest conversation units when over the token budget.
+        """Prune oldest conversation turns when context budget is exceeded.
 
-        Prevents hallucination by dropping the oldest turns first while
-        preserving conversational coherence.
-
-        A removable UNIT is either a single non-tool message, or an assistant
-        message carrying tool_calls together with ALL immediately-following
+        Pruning removes turns in complete atomic UNITs: (a) a user turn
+        along with its immediately following assistant response and any
+        tool results, or (b) an assistant tool_calls turn along with its
         contiguous role:tool results - so pruning can never orphan a tool
         message (OpenAI-compatible servers reject those with HTTP 400). The
         system prompt (index 0) and the newest user turn are never removed.
@@ -329,22 +257,14 @@ class Agent:
                     newest_user = idx
             if newest_user <= 1:
                 break  # only the newest user turn remains; nothing safely prunable
-            # Determine removable UNIT starting at 1, never including the newest user
             head = self.messages[1]
             end = 2
             if head.get("role") == "user":
-                # User turn: include the following assistant (with or without tool_calls) and its tools
-                # so we don't leave a dangling assistant/tool without its user query
-                # which triggers Jinja "No user query found" on some templates
                 if end < len(self.messages) and self.messages[end].get("role") == "assistant":
                     end += 1
-                    # Include any immediately following tool results
                     while end < len(self.messages) and self.messages[end].get("role") == "tool":
                         end += 1
-                # Safety: don't delete the newest user
                 if newest_user < end:
-                    # The unit would include the newest user, so just delete the single old user
-                    # (should not happen since newest_user is last, but keep safe)
                     end = 2
                     if 1 <= newest_user < end:
                         break
@@ -352,7 +272,6 @@ class Agent:
                 while (end < len(self.messages)
                        and self.messages[end].get("role") == "tool"):
                     end += 1
-            # Final safety: never delete the newest user
             if 1 <= newest_user < end:
                 break
             del self.messages[1:end]
@@ -362,18 +281,13 @@ class Agent:
     def submit(self, user_text: str) -> None:
         """Run the full agent loop for one user request (blocking)."""
         self._prune_context()
-        # Sanitize existing messages: Ollama Go rejects content=null (<nil>)
         for m in self.messages:
             if "content" not in m or m["content"] is None:
                 m["content"] = ""
             elif not isinstance(m["content"], str):
                 m["content"] = str(m["content"])
         self.messages.append({"role": "user", "content": user_text})
-        is_greeting = _is_simple_greeting(user_text)
-        self._last_user_text = user_text
-        self._is_greeting = is_greeting
         self.cancelled = False
-        # Immediate feedback: show spinner before any network wait (TTFT)
         try:
             self.hooks.on_start()
         except Exception:
@@ -382,7 +296,6 @@ class Agent:
         max_rounds = max(1, int(self.config.max_tool_rounds))
 
         for rnd in range(1, max_rounds + 1):
-            # Show instant spinner for every LLM round (tool rounds have TTFT too)
             if rnd > 1:
                 try:
                     self.hooks.on_start()
@@ -393,9 +306,8 @@ class Agent:
             t_first_token: float | None = None
             approx_before = self._approx_tokens()
             try:
-                tools_schema = None if is_greeting else self._tools_schema()
                 for event in self.client.chat_stream(self.messages,
-                                                     tools_schema=tools_schema,
+                                                     tools_schema=self._tools_schema(),
                                                      cancel=flag):
                     if event["type"] in ("delta", "reasoning") and t_first_token is None:
                         t_first_token = time.monotonic()
@@ -417,59 +329,37 @@ class Agent:
                 self.hooks.on_error("stream ended without final turn")
                 return
 
-            # Merge agent timings into turn.stats (preserve llm wall_duration_s etc.)
             if not hasattr(turn, "stats") or turn.stats is None:
                 turn.stats = {}
             if not isinstance(turn.stats, dict):
                 turn.stats = {"_raw": turn.stats}
-            # wall_duration_s: prefer llm's value, fallback to agent measurement
             if turn.stats.get("wall_duration_s") is None:
                 turn.stats["wall_duration_s"] = t_done - t0
-            # ttft
             turn.stats["ttft_s"] = (t_first_token - t0) if t_first_token is not None else None
             turn.stats["approx_tokens_before"] = approx_before
-            # placeholder for after (updated after assistant message appended)
             turn.stats["approx_tokens_after"] = self._approx_tokens()
-            # tool timings list shared with hook reference
             tool_timings: list[dict] = []
-            # Preserve any existing tool_calls stats? Use our list
             turn.stats["tool_calls"] = tool_timings
             turn.stats["tool_total_s"] = 0.0
             turn.stats.setdefault("ollama", None)
             turn.stats.setdefault("usage", None)
 
-            if is_greeting:
-                turn.tool_calls = []
-                turn.content = _sanitize_turn_content(
-                    turn.content,
-                    self.config,
-                    is_greeting=True,
-                    user_text=user_text,
-                )
-            elif turn.content:
-                turn.content = _sanitize_turn_content(
-                    turn.content,
-                    self.config,
-                    is_greeting=False,
-                    user_text=user_text,
-                )
+            if turn.content:
+                turn.content = _sanitize_turn_content(turn.content, self.config)
 
             self.hooks.on_assistant_done(turn)
             self.messages.append(self._assistant_message(turn))
-            # Update approx after assistant message
             turn.stats["approx_tokens_after"] = self._approx_tokens()
 
             if not turn.tool_calls:
                 return
-            if self.cancelled:  # stop between rounds; skip pending tool execution
+            if self.cancelled:
                 return
             for call in turn.tool_calls:
                 if self.cancelled:
                     break
                 self.messages.append(self._execute_tool(call, _timings=tool_timings))
-            # Update total after all tools
             turn.stats["tool_total_s"] = sum(t.get("duration_s", 0.0) for t in tool_timings)
-            # Also keep tool_calls list live (already updated via shared reference)
             self.hooks.on_status({"round": rnd, "max": max_rounds,
                                   "approx_tokens": self._approx_tokens()})
             if self.cancelled:

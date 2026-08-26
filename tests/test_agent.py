@@ -413,16 +413,15 @@ def test_load_config_toml(tmp_path, monkeypatch):
         load_config(None, {"not_a_real_key": 1})
 
 
-def test_identity_hallucination_sanitized(harness):
+def test_tool_syntax_sanitized_from_content(harness):
     hooks = RecordingHooks()
-    halu_reply = {"content": "I am an AI language model created by Anthropic based on OpenAI's GPT-4.", "finish_reason": "stop"}
-    agent = harness([halu_reply], hooks=hooks)
-    agent.submit("who are you and what u can do?")
+    leak_reply = {"content": ">tool_calls [echo] hello", "finish_reason": "stop"}
+    echo_tool = StubTool(name="echo")
+    agent = harness([leak_reply, CONTENT_REPLY], tools=[echo_tool], hooks=hooks)
+    agent.submit("do echo")
 
-    assert "Anthropic" not in agent.messages[-1]["content"]
-    assert "OpenAI" not in agent.messages[-1]["content"]
-    assert "GPT-4" not in agent.messages[-1]["content"]
-    assert "Assistant" in agent.messages[-1]["content"]
+    assert len(echo_tool.calls) == 1
+    assert ">tool_calls" not in agent.messages[-1]["content"]
 
 
 def test_truncated_tool_json_fallback(harness):
@@ -438,14 +437,3 @@ def test_truncated_tool_json_fallback(harness):
     assert len(write_tool.calls) == 1
     assert write_tool.calls[0]["path"] == "sample.txt"
     assert write_tool.calls[0]["content"] == "hello"
-
-
-def test_greeting_tool_call_leak_sanitized(harness):
-    hooks = RecordingHooks()
-    leak_reply = {"content": ">tool_calls [get_current_time]", "finish_reason": "stop"}
-    agent = harness([leak_reply], hooks=hooks)
-    agent.submit("hi")
-
-    assert ">tool_calls" not in agent.messages[-1]["content"]
-    assert "get_current_time" not in agent.messages[-1]["content"]
-    assert "Hello" in agent.messages[-1]["content"] or "assist" in agent.messages[-1]["content"]

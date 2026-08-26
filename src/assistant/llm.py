@@ -73,8 +73,8 @@ def _strip_fences(s: str) -> str:
 _TOOL_LEAK_PATTERNS = (
     re.compile(r">tool_calls?", re.IGNORECASE),
     re.compile(r"<\/?tool_calls?>", re.IGNORECASE),
-    re.compile(r"\[(get_current_time|websearch|webfetch|read_file|write_file|delete_file|list_files|shell)[^\]]*\]", re.IGNORECASE),
     re.compile(r"\btool_calls?\s*:\s*\[", re.IGNORECASE),
+    re.compile(r"\[\s*[a-zA-Z0-9_]+\s*(?:\(.*?\))?\s*\]"),
 )
 
 
@@ -200,7 +200,7 @@ class LLMClient:
                         # Hint for common template error
                         hint = ""
                         if "No user query" in clean:
-                            hint = " — coba /clear atau /session new untuk reset history (template butuh user message)"
+                            hint = " (reset conversation history with /clear or /session new)"
                         raise LLMError(f"HTTP {resp.status_code}: {clean}{hint}")
 
                     raw_lines: list[str] = []
@@ -326,7 +326,7 @@ class LLMClient:
                             finish_reason = choice["finish_reason"]
         except httpx.TimeoutException as exc:
             raise LLMError(
-                f"request timed out after {self.timeout_s}s (potato laptop may need longer) — "
+                f"request timed out after {self.timeout_s}s — "
                 f"try increasing timeout_s in config or use a faster model"
             ) from exc
         except httpx.HTTPError as exc:
@@ -414,10 +414,8 @@ class LLMClient:
                                         args = json.loads(args)
                                     except Exception:
                                         pass
-                                elif "query" in fn and "arguments" not in fn:
-                                    args = {"query": fn["query"]}
-                                elif "path" in fn and "arguments" not in fn:
-                                    args = {"path": fn["path"]}
+                                elif isinstance(fn, dict):
+                                    args = {k: v for k, v in fn.items() if k not in ("name", "function", "id", "type")}
                                 tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=fn["name"], arguments=args if isinstance(args, dict) else {}))
                         except Exception:
                             pass
@@ -433,24 +431,23 @@ class LLMClient:
                                             args = json.loads(args)
                                         except Exception:
                                             pass
+                                    elif not isinstance(args, dict):
+                                        args = {k: v for k, v in obj.items() if k not in ("name", "function", "id", "type")}
                                     tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=obj["name"], arguments=args if isinstance(args, dict) else {}))
                                     break
                             except Exception:
                                 continue
                         if not tool_calls:
                             args = {}
-                            path_m = re.search(r'"path"\s*:\s*"([^"]+)"', sub)
-                            if path_m:
-                                args["path"] = path_m.group(1)
-                            content_m = re.search(r'"content"\s*:\s*"([^"]*)"?', sub)
-                            if content_m:
-                                args["content"] = content_m.group(1)
-                            query_m = re.search(r'"query"\s*:\s*"([^"]+)"', sub)
-                            if query_m:
-                                args["query"] = query_m.group(1)
-                            command_m = re.search(r'"command"\s*:\s*"([^"]+)"', sub)
-                            if command_m:
-                                args["command"] = command_m.group(1)
+                            for kv_match in re.finditer(r'"([a-zA-Z0-9_]+)"\s*:\s*("(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?|true|false|null)', sub):
+                                k = kv_match.group(1)
+                                if k in ("name", "function", "id", "type"):
+                                    continue
+                                v_raw = kv_match.group(2)
+                                try:
+                                    args[k] = json.loads(v_raw)
+                                except Exception:
+                                    args[k] = v_raw.strip('"')
                             if name:
                                 tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=name, arguments=args))
 

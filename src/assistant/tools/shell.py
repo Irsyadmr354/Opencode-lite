@@ -79,6 +79,7 @@ def shell_tool(workspace: pathlib.Path, config) -> Tool:
         },
         danger=True,
         fn=fn,
+        permission_key="shell",
     )
 
 

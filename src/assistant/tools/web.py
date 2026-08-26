@@ -186,6 +186,7 @@ def webfetch_tool(workspace: pathlib.Path, config) -> Tool:
         },
         danger=False,
         fn=fn,
+        permission_key="webfetch",
     )
 
 
@@ -231,6 +232,7 @@ def websearch_tool(workspace: pathlib.Path, config) -> Tool:
         },
         danger=False,
         fn=fn,
+        permission_key="websearch",
     )
 
 
