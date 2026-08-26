@@ -108,7 +108,16 @@ def _pretty_json(args: Any, max_lines: int = ARGS_PREVIEW_LINES) -> str:
     return "\n".join(lines)
 
 
-_UI_TOOL_LEAK_RE = re.compile(r"<\/?tool_calls?>|>tool_calls?|\[\s*[a-zA-Z0-9_]+\s*(?:\(.*?\))?\s*\]", re.IGNORECASE)
+_UI_TOOL_LEAK_RE = re.compile(
+    r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>|"
+    r"\[\/?(?:TOOL_CALLS?|TOOLS|ACTIONS?)\]|"
+    r">tool_calls?|"
+    r"\btool_calls?\s*:\s*\[|"
+    r"\{\s*\"type\"\s*:\s*\"function\"|"
+    r"\{\s*\"function\"\s*:\s*\{|"
+    r"\[\s*[a-zA-Z0-9_]+\s*(?:\(.*?\))?\s*\]",
+    re.IGNORECASE,
+)
 
 
 def _is_tool_json_display(s: str) -> bool:

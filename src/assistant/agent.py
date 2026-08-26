@@ -39,15 +39,29 @@ def _resolve_identity(config: Config | None, default_ws: str | None = None) -> s
     return f"Assistant, coding agent in workspace {ws}."
 
 
+_HALU_PERSONA_RE = re.compile(
+    r"\b(claude|anthropic|openai|gpt-4|gpt-3\.5|chatgpt)\b",
+    re.IGNORECASE,
+)
+
+
 def _sanitize_turn_content(content: str | None, config: Config | None = None) -> str | None:
     if not content or not isinstance(content, str):
         return content
     # Strip any leaked raw tool call syntax markers from content
-    cleaned = re.sub(r">tool_calls?\s*\[[^\]]*\]", "", content, flags=re.IGNORECASE)
-    cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub(r"<\/?tool_calls?>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>.*?(?:<\/(?:tools|tool_calls?|function_calls?|actions?)>|$)", "", content, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r">tool_calls?\s*\[[^\]]*\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r">tool_calls?\s*\{.*?\}", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-    return cleaned.strip()
+    cleaned = re.sub(r"\{\s*\"type\"\s*:\s*\"function\".*?\}", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.strip()
+
+    # Universal identity replacement: if model hallucinates a vendor/model name (Claude, OpenAI, etc.),
+    # replace it with the configured identity name without altering the user's language or sentence structure.
+    if _HALU_PERSONA_RE.search(cleaned):
+        cleaned = _HALU_PERSONA_RE.sub("Assistant", cleaned)
+
+    return cleaned
 
 
 class Hooks:

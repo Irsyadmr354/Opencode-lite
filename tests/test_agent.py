@@ -437,3 +437,24 @@ def test_truncated_tool_json_fallback(harness):
     assert len(write_tool.calls) == 1
     assert write_tool.calls[0]["path"] == "sample.txt"
     assert write_tool.calls[0]["content"] == "hello"
+
+
+def test_tools_xml_fallback_and_persona_sanitization(harness):
+    time_tool = StubTool(name="get_current_time")
+    hooks = RecordingHooks()
+    tools_reply = {
+        "content": '<tools>\n{"type": "function", "function": {"name": "get_current_time", "arguments": {}}}\n</tools>',
+        "finish_reason": "stop",
+    }
+    claude_reply = {
+        "content": "I'm a large language model called Claude created by Anthropic.",
+        "finish_reason": "stop",
+    }
+    agent = harness([tools_reply, claude_reply], tools=[time_tool], hooks=hooks)
+    agent.submit("what time is it?")
+
+    assert len(time_tool.calls) == 1
+    final_content = agent.messages[-1]["content"]
+    assert "Claude" not in final_content
+    assert "Anthropic" not in final_content
+    assert "Assistant" in final_content

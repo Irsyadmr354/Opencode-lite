@@ -71,10 +71,13 @@ def _strip_fences(s: str) -> str:
 
 
 _TOOL_LEAK_PATTERNS = (
+    re.compile(r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>", re.IGNORECASE),
+    re.compile(r"\[\/?(?:TOOL_CALLS?|TOOLS|ACTIONS?)\]", re.IGNORECASE),
     re.compile(r">tool_calls?", re.IGNORECASE),
-    re.compile(r"<\/?tool_calls?>", re.IGNORECASE),
     re.compile(r"\btool_calls?\s*:\s*\[", re.IGNORECASE),
     re.compile(r"\[\s*[a-zA-Z0-9_]+\s*(?:\(.*?\))?\s*\]"),
+    re.compile(r'\{\s*"type"\s*:\s*"function"', re.IGNORECASE),
+    re.compile(r'\{\s*"function"\s*:\s*\{', re.IGNORECASE),
 )
 
 
@@ -347,20 +350,32 @@ class LLMClient:
         # If native tool_calls were not parsed from SSE, check if model dumped tool calls in content
         raw_content = "".join(content_parts)
         if not tool_calls and raw_content:
-            # 1. Check for XML tags <tool_call>...</tool_call>
-            for m in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", raw_content, re.DOTALL):
+            # 1. Check for XML tags <tool_call>...</tool_call> or <tools>...</tools>
+            for m in re.finditer(r"<(?:tool_call|tools)>\s*(.*?)\s*</(?:tool_call|tools)>", raw_content, re.DOTALL | re.IGNORECASE):
+                block = m.group(1).strip()
                 try:
-                    obj = json.loads(m.group(1).strip())
-                    if isinstance(obj, dict) and "name" in obj:
-                        args = obj.get("arguments", {})
-                        if isinstance(args, str):
-                            try:
-                                args = json.loads(args)
-                            except Exception:
-                                pass
-                        tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=obj["name"], arguments=args if isinstance(args, dict) else {}))
+                    obj = json.loads(block)
+                    if isinstance(obj, dict):
+                        fn = obj.get("function") if "function" in obj else obj
+                        if isinstance(fn, dict) and "name" in fn:
+                            args = fn.get("arguments", {})
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except Exception:
+                                    pass
+                            tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=fn["name"], arguments=args if isinstance(args, dict) else {}))
+                        elif isinstance(fn, dict):
+                            for k, v in fn.items():
+                                if k != "type" and isinstance(k, str) and not k.startswith("{"):
+                                    tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=k, arguments=v if isinstance(v, dict) else {}))
+                                    break
                 except Exception:
                     pass
+                if not tool_calls and '"' in block:
+                    fn_match = re.search(r'"([a-zA-Z0-9_]+)"', block)
+                    if fn_match:
+                        tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=fn_match.group(1), arguments={}))
 
             # 1b. Check for >tool_calls [name] or >tool_calls [name(args)]
             for m in re.finditer(r">tool_calls?\s*\[([a-zA-Z0-9_]+)(?:\((.*?)\))?\]", raw_content):
@@ -462,9 +477,11 @@ class LLMClient:
         if tool_calls:
             clean_content = ""
         else:
+            clean_content = re.sub(r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>.*?(?:<\/(?:tools|tool_calls?|function_calls?|actions?)>|$)", "", clean_content, flags=re.DOTALL | re.IGNORECASE)
             clean_content = re.sub(r">tool_calls?\s*\[[^\]]*\]", "", clean_content, flags=re.IGNORECASE)
-            clean_content = re.sub(r"<\/?tool_calls?>", "", clean_content, flags=re.IGNORECASE)
+            clean_content = re.sub(r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>", "", clean_content, flags=re.IGNORECASE)
             clean_content = re.sub(r">tool_calls?\s*\{.*?\}", "", clean_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_content = re.sub(r"\{\s*\"type\"\s*:\s*\"function\".*?\}", "", clean_content, flags=re.DOTALL | re.IGNORECASE)
             clean_content = clean_content.strip()
         reasoning_text = "".join(reasoning_parts) or None
         if reasoning_text is None and inline_thoughts.strip():
