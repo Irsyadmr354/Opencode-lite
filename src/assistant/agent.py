@@ -41,10 +41,14 @@ def _get_live_datetime_str() -> str:
     return f"{local.strftime('%Y-%m-%d %H:%M:%S')} ({local.strftime('%A')})"
 
 
-def build_system_prompt(workspace: Path | str) -> str:
-    """Build ultra-concise dynamic system prompt."""
+def build_system_prompt(workspace: Path | str, tools: list[Tool] | list[str] | None = None) -> str:
+    """Build ultra-concise dynamic system prompt with dynamic tools and workspace."""
+    if tools:
+        tool_names = ", ".join(t.name if hasattr(t, "name") else str(t) for t in tools)
+    else:
+        tool_names = "read_file, write_file, delete_file, list_files, shell, websearch, webfetch, get_current_time"
     return (
-        f"Be concise. Assistant in {workspace}. Tools: read_file, write_file, delete_file, list_files, shell, websearch, webfetch, get_current_time.\n"
+        f"Be concise. Assistant in {workspace}. Tools: {tool_names}.\n"
         "Before websearch/webfetch, call get_current_time."
     )
 
@@ -130,8 +134,8 @@ class Agent:
         self._refresh_system_prompt()
 
     def _refresh_system_prompt(self) -> None:
-        """Update system prompt with the live current datetime on each turn."""
-        prompt = build_system_prompt(self.workspace)
+        """Update system prompt with dynamic workspace and tools on each turn."""
+        prompt = build_system_prompt(self.workspace, self.tools)
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = prompt
         else:

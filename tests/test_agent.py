@@ -29,6 +29,7 @@ def test_get_live_datetime_str():
 
 
 def test_build_system_prompt_date_and_workspace():
+    # Default tools
     prompt = build_system_prompt("/test/workspace")
     assert prompt.startswith("Be concise.")
     assert "/test/workspace" in prompt
@@ -38,6 +39,11 @@ def test_build_system_prompt_date_and_workspace():
     assert "websearch" in prompt
     assert "webfetch" in prompt
     assert "Assistant" in prompt
+    assert "Before websearch/webfetch, call get_current_time." in prompt
+
+    # Dynamic custom tools
+    custom_prompt = build_system_prompt("/custom", ["tool_a", "tool_b"])
+    assert "Tools: tool_a, tool_b" in custom_prompt
 
 
 def test_system_prompt_refreshed_on_every_turn(tmp_path):
