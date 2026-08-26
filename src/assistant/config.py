@@ -42,6 +42,7 @@ class Config:
     timeout_s: int = 600
     max_context_tokens: int = 12000
     system_prompt: str | None = None  # universal: null -> generic fallback, set in config.toml
+    identity: str | None = None  # separate identity: set in config.toml [identity] or identity
     limits: Limits = field(default_factory=Limits)
     permissions: Permissions = field(default_factory=Permissions)
     shell_cmd: list[str] = field(
@@ -64,6 +65,7 @@ _TOP_LEVEL_KEYS = {
     "shell_cmd",
     "system_prompt",
     "prompt",  # table [prompt] with system key
+    "identity",  # identity string or [identity] table
 }
 
 
@@ -98,6 +100,7 @@ def _split_mapping(raw: dict | None) -> tuple[dict, dict, dict]:
     limits = data.pop("limits", {}) or {}
     permissions = data.pop("permissions", {}) or {}
     prompt_tbl = data.pop("prompt", None)
+    identity_tbl = data.pop("identity", None)
     if not isinstance(limits, dict) or not isinstance(permissions, dict):
         raise ValueError("[limits] and [permissions] must be tables")
     # normalize [prompt] table -> system_prompt
@@ -110,6 +113,20 @@ def _split_mapping(raw: dict | None) -> tuple[dict, dict, dict]:
         if "system_prompt" in prompt_tbl and "system_prompt" not in data:
             data["system_prompt"] = prompt_tbl["system_prompt"]
         # ignore other prompt keys for now
+    # normalize [identity] table or string -> identity
+    if identity_tbl is not None:
+        if isinstance(identity_tbl, dict):
+            if "system" in identity_tbl and "identity" not in data:
+                data["identity"] = str(identity_tbl["system"])
+            elif "description" in identity_tbl and "identity" not in data:
+                data["identity"] = str(identity_tbl["description"])
+            elif "identity" not in data:
+                parts = [str(v) for k, v in identity_tbl.items() if v]
+                if parts:
+                    data["identity"] = ", ".join(parts)
+        elif isinstance(identity_tbl, str):
+            if "identity" not in data:
+                data["identity"] = identity_tbl
     unknown_top = sorted(set(data) - _TOP_LEVEL_KEYS)
     if unknown_top:
         raise ValueError(f"unknown config key(s): {', '.join(unknown_top)}")
@@ -136,6 +153,10 @@ def _apply(cfg: Config, top: dict, limits: dict, permissions: dict) -> None:
         sp = top["system_prompt"]
         if sp is not None and not isinstance(sp, str):
             raise ValueError(f"invalid system_prompt value {sp!r}: expected string or null")
+    if "identity" in top:
+        ident = top["identity"]
+        if ident is not None and not isinstance(ident, str):
+            raise ValueError(f"invalid identity value {ident!r}: expected string or null")
     for key, value in top.items():
         setattr(cfg, key, value)
     for key, value in limits.items():

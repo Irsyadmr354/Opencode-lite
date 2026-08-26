@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
 from .config import Config
 from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for typing)
 
-DEFAULT_SYSTEM_PROMPT = "You are Assistant, coding agent in workspace."
+DEFAULT_SYSTEM_PROMPT = (
+    "You are Assistant, coding agent in workspace. Tools: get_current_time, "
+    "websearch, webfetch, read_file, write_file, delete_file, list_files, shell. "
+    "For current/news/search: call get_current_time then websearch with date. "
+    "Always list_files '.' before read, if vague list immediately. "
+    "Be concise, no intro/outro/headers, >20 lines -> file, no JSON, use tool_calls."
+)
 
 # Kept for backwards compat / tests — prefer config.system_prompt at runtime
 SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
@@ -21,6 +28,34 @@ def _resolve_system_prompt(config: Config | None) -> str:
         if sp:
             return sp
     return DEFAULT_SYSTEM_PROMPT
+
+
+def _resolve_identity(config: Config | None, default_ws: str | None = None) -> str:
+    if config is not None and getattr(config, "identity", None):
+        ident = str(config.identity).strip()
+        if ident:
+            return ident
+    ws = default_ws or (str(config.workspace) if config and hasattr(config, "workspace") else "workspace")
+    return f"Assistant, coding agent in workspace {ws}."
+
+
+_HALU_RE = re.compile(
+    r"\b(anthropic|openai|gpt-4|gpt-3\.5|chatgpt|as an ai language model|i am an ai language model|i'm an ai language model|created by anthropic|created by openai|based on openai)\b",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_turn_content(content: str | None, config: Config | None) -> str | None:
+    if not content or not isinstance(content, str):
+        return content
+    if _HALU_RE.search(content):
+        ws = str(config.workspace) if config and hasattr(config, "workspace") else "workspace"
+        ident = _resolve_identity(config, ws)
+        lowered = content.lower()
+        if any(k in lowered for k in ("saya", "adalah", "model", "bahasa", "dibuat", "oleh")):
+            return f"Assistant, coding agent di workspace {ws}. Bisa bantu baca/tulis/hapus file, list file, shell, dan websearch/webfetch."
+        return f"{ident} Capabilities: read/write/delete files, list files, shell commands, websearch/webfetch."
+    return content
 
 _GREETING_TOKENS = {"hi", "hello", "hey", "yo", "sup", "hiya", "howdy"}
 
@@ -161,14 +196,13 @@ class Agent:
 
     def _assistant_message(self, turn) -> dict:
         # Always set content as string - Ollama rejects null/missing content (Go <nil>)
-        content = turn.content if isinstance(turn.content, str) else ""
+        content = _sanitize_turn_content(turn.content, self.config) if isinstance(turn.content, str) else ""
         # If model dumped tool JSON as content but also provided tool_calls, hide the JSON
         if turn.tool_calls and content:
             stripped = content.strip()
             # strip fences for check
-            import re as _re
-            fenced = _re.sub(r"^```[a-z]*\s*\n?", "", stripped, flags=_re.IGNORECASE)
-            fenced = _re.sub(r"\n?```\s*$", "", fenced).strip()
+            fenced = re.sub(r"^```[a-z]*\s*\n?", "", stripped, flags=re.IGNORECASE)
+            fenced = re.sub(r"\n?```\s*$", "", fenced).strip()
             if fenced.startswith("{") and '"name"' in fenced and '"arguments"' in fenced:
                 content = ""
             elif '"name"' in content and '"arguments"' in content and (content.strip().startswith("{") or content.strip().startswith("```")):
@@ -354,6 +388,9 @@ class Agent:
             turn.stats["tool_total_s"] = 0.0
             turn.stats.setdefault("ollama", None)
             turn.stats.setdefault("usage", None)
+
+            if turn.content:
+                turn.content = _sanitize_turn_content(turn.content, self.config)
 
             self.hooks.on_assistant_done(turn)
             self.messages.append(self._assistant_message(turn))

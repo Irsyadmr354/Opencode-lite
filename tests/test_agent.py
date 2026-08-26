@@ -411,3 +411,30 @@ def test_load_config_toml(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError):
         load_config(None, {"not_a_real_key": 1})
+
+
+def test_identity_hallucination_sanitized(harness):
+    hooks = RecordingHooks()
+    halu_reply = {"content": "I am an AI language model created by Anthropic based on OpenAI's GPT-4.", "finish_reason": "stop"}
+    agent = harness([halu_reply], hooks=hooks)
+    agent.submit("who are you and what u can do?")
+
+    assert "Anthropic" not in agent.messages[-1]["content"]
+    assert "OpenAI" not in agent.messages[-1]["content"]
+    assert "GPT-4" not in agent.messages[-1]["content"]
+    assert "Assistant" in agent.messages[-1]["content"]
+
+
+def test_truncated_tool_json_fallback(harness):
+    write_tool = StubTool(name="write_file")
+    hooks = RecordingHooks()
+    truncated_reply = {
+        "content": '```json\n{"name": "write_file", "arguments": {"path": "sample.txt", "content": "hello"',
+        "finish_reason": "stop",
+    }
+    agent = harness([truncated_reply, CONTENT_REPLY], tools=[write_tool], hooks=hooks)
+    agent.submit("create file")
+
+    assert len(write_tool.calls) == 1
+    assert write_tool.calls[0]["path"] == "sample.txt"
+    assert write_tool.calls[0]["content"] == "hello"

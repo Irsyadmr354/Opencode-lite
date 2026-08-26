@@ -293,3 +293,14 @@ def test_ui_reset_stream_semantics():
     output2 = out2.getvalue()
     assert "\r\033[2K" in output2
     assert hooks2._header_active is False
+
+
+def test_ui_hides_tool_json_leaks():
+    out = io.StringIO()
+    hooks = ui_mod.TerminalHooks(stdout=out)
+    hooks.on_delta('```json\n{"name": "write_file", "arguments": {"path": "a.txt", "content": "123"}}\n```')
+    hooks.on_assistant_done(SimpleNamespace(content='```json\n{"name": "write_file", "arguments": {"path": "a.txt", "content": "123"}}\n```', tool_calls=[SimpleNamespace(id="1", name="write_file", arguments={"path": "a.txt"})]))
+    output = out.getvalue()
+    assert '"name"' not in output
+    assert '"write_file"' not in output
+    assert '"arguments"' not in output

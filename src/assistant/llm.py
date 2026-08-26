@@ -71,11 +71,16 @@ def _strip_fences(s: str) -> str:
 
 
 def _looks_like_tool_json(s: str) -> bool:
-    t = _strip_fences(s).strip()
-    if not t.startswith("{"):
+    if not s:
         return False
-    # must contain "name" and ("arguments" or "query" or "path")
-    return '"name"' in t and ('"arguments"' in t or '"query"' in t or '"path"' in t)
+    if '"name"' in s and ('"arguments"' in s or '"query"' in s or '"path"' in s or '"command"' in s or '"content"' in s):
+        return True
+    t = _strip_fences(s).strip()
+    if t.startswith("{") and '"name"' in t:
+        return True
+    if "```json" in s and '"name"' in s:
+        return True
+    return False
 
 
 class LLMClient:
@@ -237,7 +242,11 @@ class LLMClient:
                                 pass  # leaked tool JSON, hide
                             elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass  # don't yield tool JSON as visible text
-                            elif accum.strip().startswith("{") and '"name"' in accum and '"arguments"' in accum:
+                            elif accum.strip().startswith("{") and '"name"' in accum:
+                                pass
+                            elif accum.strip().startswith("```") and '"name"' in accum:
+                                pass
+                            elif "```json" in text or "```json" in accum:
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
@@ -284,7 +293,11 @@ class LLMClient:
                                 pass
                             elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass
-                            elif accum.strip().startswith("{") and '"name"' in accum and '"arguments"' in accum:
+                            elif accum.strip().startswith("{") and '"name"' in accum:
+                                pass
+                            elif accum.strip().startswith("```") and '"name"' in accum:
+                                pass
+                            elif "```json" in text or "```json" in accum:
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
@@ -335,50 +348,88 @@ class LLMClient:
                 except Exception:
                     pass
 
-            # 2. Check for raw json function call strings (including ```json fences)
-            if not tool_calls:
-                clean_c = _strip_fences(raw_content)
-                if _looks_like_tool_json(clean_c):
-                    try:
-                        # try to extract the JSON object inside fences/markdown
-                        json_match = re.search(r"\{.*\}", clean_c, re.DOTALL)
-                        if json_match:
-                            obj = json.loads(json_match.group(0))
-                        else:
-                            obj = json.loads(clean_c)
-                        fn = obj.get("function") if "function" in obj else obj
-                        if isinstance(fn, dict) and "name" in fn:
-                            args = fn.get("arguments", {})
-                            if isinstance(args, str):
-                                try:
-                                    args = json.loads(args)
-                                except Exception:
-                                    pass
-                            elif "query" in fn:
-                                args = {"query": fn["query"]}
-                            elif "path" in fn:
-                                args = {"path": fn["path"]}
-                            tool_calls.append(ToolCall(id="call_fallback", name=fn["name"], arguments=args if isinstance(args, dict) else {}))
-                            raw_content = ""
-                    except Exception:
-                        pass
-                # also handle multiple tool calls in fences
-                if not tool_calls and "```" in raw_content and '"name"' in raw_content:
-                    for m in re.finditer(r"\{[^{}]*\"name\"\s*:\s*\"[^\"]+\"[^{}]*\}", raw_content, re.DOTALL):
+            # 2. Check for raw json function call strings (including ```json fences and truncated JSON)
+            if not tool_calls and ('"name"' in raw_content):
+                for m in re.finditer(r'\{[^{}]*?"name"\s*:\s*"([^"]+)"', raw_content, re.DOTALL):
+                    name = m.group(1)
+                    start_idx = m.start()
+                    sub = raw_content[start_idx:]
+                    brace_count = 0
+                    end_idx = -1
+                    in_str = False
+                    escape = False
+                    for i, ch in enumerate(sub):
+                        if escape:
+                            escape = False
+                            continue
+                        if ch == '\\':
+                            escape = True
+                            continue
+                        if ch == '"':
+                            in_str = not in_str
+                            continue
+                        if not in_str:
+                            if ch == '{':
+                                brace_count += 1
+                            elif ch == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    end_idx = i + 1
+                                    break
+                    if end_idx != -1:
+                        candidate = sub[:end_idx]
                         try:
-                            obj = json.loads(m.group(0))
-                            if isinstance(obj, dict) and "name" in obj:
-                                args = obj.get("arguments", {})
+                            obj = json.loads(candidate)
+                            fn = obj.get("function") if isinstance(obj, dict) and "function" in obj else obj
+                            if isinstance(fn, dict) and "name" in fn:
+                                args = fn.get("arguments", {})
                                 if isinstance(args, str):
                                     try:
                                         args = json.loads(args)
                                     except Exception:
                                         pass
-                                tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=obj["name"], arguments=args if isinstance(args, dict) else {}))
+                                elif "query" in fn and "arguments" not in fn:
+                                    args = {"query": fn["query"]}
+                                elif "path" in fn and "arguments" not in fn:
+                                    args = {"path": fn["path"]}
+                                tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=fn["name"], arguments=args if isinstance(args, dict) else {}))
                         except Exception:
-                            continue
-                    if tool_calls:
-                        raw_content = ""
+                            pass
+                    else:
+                        candidate = sub.rstrip()
+                        for suffix in ("}", '"}', '"} }', '"} } }', '"}'):
+                            try:
+                                obj = json.loads(candidate + suffix)
+                                if isinstance(obj, dict) and "name" in obj:
+                                    args = obj.get("arguments", {})
+                                    if isinstance(args, str):
+                                        try:
+                                            args = json.loads(args)
+                                        except Exception:
+                                            pass
+                                    tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=obj["name"], arguments=args if isinstance(args, dict) else {}))
+                                    break
+                            except Exception:
+                                continue
+                        if not tool_calls:
+                            args = {}
+                            path_m = re.search(r'"path"\s*:\s*"([^"]+)"', sub)
+                            if path_m:
+                                args["path"] = path_m.group(1)
+                            content_m = re.search(r'"content"\s*:\s*"([^"]*)"?', sub)
+                            if content_m:
+                                args["content"] = content_m.group(1)
+                            query_m = re.search(r'"query"\s*:\s*"([^"]+)"', sub)
+                            if query_m:
+                                args["query"] = query_m.group(1)
+                            command_m = re.search(r'"command"\s*:\s*"([^"]+)"', sub)
+                            if command_m:
+                                args["command"] = command_m.group(1)
+                            if name:
+                                tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=name, arguments=args))
+
+                if tool_calls:
+                    raw_content = ""
 
         # Store CLEANED content: inline think markup was extracted from the
         # RAW content above (tool-call fallback) and must not be replayed

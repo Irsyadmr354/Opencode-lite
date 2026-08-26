@@ -183,14 +183,22 @@ def _tag_holdback(buffer: str, in_think: bool, at_line_start: bool = False) -> i
 
 
 def _is_tool_json_display(s: str) -> bool:
+    if not s:
+        return False
     # aggressive: any leaked tool JSON (fenced or raw) should be hidden
     if '"name"' in s and '"arguments"' in s:
+        return True
+    if '"name"' in s and ('"path"' in s or '"query"' in s or '"command"' in s or '"content"' in s):
         return True
     t = s.strip()
     if t.startswith("```"):
         t = re.sub(r"^```[a-z]*\s*\n?", "", t, flags=re.IGNORECASE)
         t = re.sub(r"\n?```\s*$", "", t).strip()
-    return t.startswith("{") and '"name"' in t
+    if t.startswith("{") and '"name"' in t:
+        return True
+    if "```json" in s and '"name"' in s:
+        return True
+    return False
 
 
 def _parse_thinking_text(text: str, state: dict[str, bool]):  # type: ignore[no-untyped-def]
@@ -632,6 +640,10 @@ class TerminalHooks(Hooks):
             self._collapse_thinking(keep_header=True)
 
         self._buffer += text
+        if ('"name"' in self._buffer and '"arguments"' in self._buffer) or _is_tool_json_display(self._buffer):
+            self._buffer = ""
+            return
+
         hold = _tag_holdback(self._buffer, self._in_think, self._at_line_start)
         if hold > 0:
             to_process = self._buffer[:-hold]
