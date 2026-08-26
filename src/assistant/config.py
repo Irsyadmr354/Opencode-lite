@@ -41,6 +41,7 @@ class Config:
     verbose: bool = False
     timeout_s: int = 600
     max_context_tokens: int = 12000
+    system_prompt: str | None = None  # universal: null -> generic fallback, set in config.toml
     limits: Limits = field(default_factory=Limits)
     permissions: Permissions = field(default_factory=Permissions)
     shell_cmd: list[str] = field(
@@ -61,6 +62,8 @@ _TOP_LEVEL_KEYS = {
     "timeout_s",
     "max_context_tokens",
     "shell_cmd",
+    "system_prompt",
+    "prompt",  # table [prompt] with system key
 }
 
 
@@ -94,8 +97,19 @@ def _split_mapping(raw: dict | None) -> tuple[dict, dict, dict]:
     data = dict(raw or {})
     limits = data.pop("limits", {}) or {}
     permissions = data.pop("permissions", {}) or {}
+    prompt_tbl = data.pop("prompt", None)
     if not isinstance(limits, dict) or not isinstance(permissions, dict):
         raise ValueError("[limits] and [permissions] must be tables")
+    # normalize [prompt] table -> system_prompt
+    if prompt_tbl is not None:
+        if not isinstance(prompt_tbl, dict):
+            raise ValueError("[prompt] must be a table")
+        if "system" in prompt_tbl and "system_prompt" not in data:
+            data["system_prompt"] = prompt_tbl["system"]
+        # also allow prompt.system_prompt
+        if "system_prompt" in prompt_tbl and "system_prompt" not in data:
+            data["system_prompt"] = prompt_tbl["system_prompt"]
+        # ignore other prompt keys for now
     unknown_top = sorted(set(data) - _TOP_LEVEL_KEYS)
     if unknown_top:
         raise ValueError(f"unknown config key(s): {', '.join(unknown_top)}")
@@ -118,6 +132,10 @@ def _apply(cfg: Config, top: dict, limits: dict, permissions: dict) -> None:
         mct = top["max_context_tokens"]
         if not isinstance(mct, int) or mct <= 0:
             raise ValueError(f"invalid max_context_tokens value {mct!r}: expected positive int")
+    if "system_prompt" in top:
+        sp = top["system_prompt"]
+        if sp is not None and not isinstance(sp, str):
+            raise ValueError(f"invalid system_prompt value {sp!r}: expected string or null")
     for key, value in top.items():
         setattr(cfg, key, value)
     for key, value in limits.items():

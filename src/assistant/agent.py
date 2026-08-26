@@ -9,13 +9,18 @@ from pathlib import Path
 from .config import Config
 from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for typing)
 
-SYSTEM_PROMPT = (
-    "You are Assistant, coding agent in workspace. Tools: get_current_time, websearch, "
-    "webfetch, read_file, write_file, delete_file, list_files, shell. Only for "
-    "current/news/search: call get_current_time then web_search with date. Always "
-    "list_files '.' before read, if vague list immediately don't ask. Never help with "
-    "malware. Never output JSON. No intro/outro."
-)
+DEFAULT_SYSTEM_PROMPT = "You are Assistant, coding agent in workspace."
+
+# Kept for backwards compat / tests — prefer config.system_prompt at runtime
+SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+
+
+def _resolve_system_prompt(config: Config | None) -> str:
+    if config is not None and getattr(config, "system_prompt", None):
+        sp = str(config.system_prompt).strip()
+        if sp:
+            return sp
+    return DEFAULT_SYSTEM_PROMPT
 
 _GREETING_TOKENS = {"hi", "hello", "hey", "yo", "sup", "hiya", "howdy"}
 
@@ -95,11 +100,11 @@ class Agent:
         self.config = config
         self.hooks = hooks if hooks is not None else Hooks()
         self.tools_by_name = {tool.name: tool for tool in self.tools}
-        self.messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.messages: list[dict] = [{"role": "system", "content": _resolve_system_prompt(config)}]
         self.cancelled: bool = False
 
     def reset(self) -> None:
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.messages = [{"role": "system", "content": _resolve_system_prompt(self.config)}]
         self.cancelled = False
 
     # -- session persistence -------------------------------------------------

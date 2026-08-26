@@ -28,6 +28,11 @@ timeout_s = 600                         # request timeout in seconds (potato: 60
 max_context_tokens = 12000              # pruning limit, match your 12k local model
 # workspace = ""                        # empty -> directory you launch from
 # shell_cmd = ["powershell", "-NoProfile", "-Command"]  # Windows default
+# system_prompt = "You are Assistant, coding agent in workspace."  # universal default — override here
+
+# [prompt]
+# system = """You are Assistant, coding agent in workspace. Tools: get_current_time, websearch, webfetch, read_file, write_file, delete_file, list_files, shell. Only for current/news/search: call get_current_time then web_search with date. Always list_files '.' before read, if vague list immediately don't ask. Never output JSON. No intro/outro."""
+# Example: paste your universal prompt above and restart. Code stays clean, prompt lives in config.
 
 [permissions]
 # one of: "allow" | "ask" | "deny"
