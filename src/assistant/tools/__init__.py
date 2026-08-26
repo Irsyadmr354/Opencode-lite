@@ -48,11 +48,12 @@ def get_tools(workspace: pathlib.Path, config) -> list[Tool]:
     """Return every built-in tool bound to ``workspace``/``config``.
 
     Safe tools come first, dangerous ones last (UI groups/paints by ``danger``).
+    Time tool kept near web for 'date before search' flow but not first to avoid bias on greetings.
     """
     return (
-        _build_time_tools(workspace, config)
-        + _build_fs_tools(workspace, config)
+        _build_fs_tools(workspace, config)
         + _build_web_tools(workspace, config)
+        + _build_time_tools(workspace, config)
         + _build_shell_tools(workspace, config)
     )
 

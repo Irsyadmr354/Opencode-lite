@@ -59,6 +59,25 @@ def _separate_inline_thinking(text: str) -> tuple[str, str]:
     return clean, "".join(thoughts)
 
 
+def _strip_fences(s: str) -> str:
+    s = s.strip()
+    # remove ```json ... ``` or ``` ... ```
+    if s.startswith("```"):
+        # strip first fence line
+        s = re.sub(r"^```[a-z]*\s*\n?", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\n?```\s*$", "", s)
+        s = s.strip()
+    return s
+
+
+def _looks_like_tool_json(s: str) -> bool:
+    t = _strip_fences(s).strip()
+    if not t.startswith("{"):
+        return False
+    # must contain "name" and ("arguments" or "query" or "path")
+    return '"name"' in t and ('"arguments"' in t or '"query"' in t or '"path"' in t)
+
+
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str, timeout_s: int = 180) -> None:
         self.base_url = base_url.rstrip("/")
@@ -212,7 +231,14 @@ class LLMClient:
                         text = delta.get("content")
                         if text:
                             content_parts.append(text)
-                            yield {"type": "delta", "text": text}
+                            # suppress raw tool JSON from streaming to UI (will be tool_calls)
+                            accum = "".join(content_parts)
+                            if _looks_like_tool_json(accum) or _looks_like_tool_json(text):
+                                pass  # don't yield tool JSON as visible text
+                            elif accum.strip().startswith("{") and '"name"' in accum and '"arguments"' in accum:
+                                pass
+                            else:
+                                yield {"type": "delta", "text": text}
                         for entry in delta.get("tool_calls") or []:
                             index = entry.get("index") or 0
                             slot = pending.setdefault(
@@ -251,7 +277,13 @@ class LLMClient:
                         text = message.get("content")
                         if text:
                             content_parts.append(text)
-                            yield {"type": "delta", "text": text}
+                            accum = "".join(content_parts)
+                            if _looks_like_tool_json(accum) or _looks_like_tool_json(text):
+                                pass
+                            elif accum.strip().startswith("{") and '"name"' in accum and '"arguments"' in accum:
+                                pass
+                            else:
+                                yield {"type": "delta", "text": text}
                         for entry in message.get("tool_calls") or []:
                             fn = entry.get("function") or {}
                             pending[len(pending)] = {
@@ -299,12 +331,17 @@ class LLMClient:
                 except Exception:
                     pass
 
-            # 2. Check for raw json function call strings
+            # 2. Check for raw json function call strings (including ```json fences)
             if not tool_calls:
-                clean_c = raw_content.strip()
-                if clean_c.startswith('{"type":"function"') or clean_c.startswith('{"name":'):
+                clean_c = _strip_fences(raw_content)
+                if _looks_like_tool_json(clean_c):
                     try:
-                        obj = json.loads(clean_c)
+                        # try to extract the JSON object inside fences/markdown
+                        json_match = re.search(r"\{.*\}", clean_c, re.DOTALL)
+                        if json_match:
+                            obj = json.loads(json_match.group(0))
+                        else:
+                            obj = json.loads(clean_c)
                         fn = obj.get("function") if "function" in obj else obj
                         if isinstance(fn, dict) and "name" in fn:
                             args = fn.get("arguments", {})
@@ -321,6 +358,23 @@ class LLMClient:
                             raw_content = ""
                     except Exception:
                         pass
+                # also handle multiple tool calls in fences
+                if not tool_calls and "```" in raw_content and '"name"' in raw_content:
+                    for m in re.finditer(r"\{[^{}]*\"name\"\s*:\s*\"[^\"]+\"[^{}]*\}", raw_content, re.DOTALL):
+                        try:
+                            obj = json.loads(m.group(0))
+                            if isinstance(obj, dict) and "name" in obj:
+                                args = obj.get("arguments", {})
+                                if isinstance(args, str):
+                                    try:
+                                        args = json.loads(args)
+                                    except Exception:
+                                        pass
+                                tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=obj["name"], arguments=args if isinstance(args, dict) else {}))
+                        except Exception:
+                            continue
+                    if tool_calls:
+                        raw_content = ""
 
         # Store CLEANED content: inline think markup was extracted from the
         # RAW content above (tool-call fallback) and must not be replayed

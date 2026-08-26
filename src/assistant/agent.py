@@ -11,10 +11,9 @@ from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for t
 
 SYSTEM_PROMPT = (
     "You are Assistant, coding agent in workspace. Tools: get_current_time, websearch, "
-    "webfetch, read_file, write_file, delete_file, list_files, shell. Must check "
-    "tools date before searching and use that to get newest update: call "
-    "get_current_time before web_search, append that date to query. Use tools, "
-    "never fabricate. No intro/outro/chit-chat or headers (#, ##, ###)."
+    "webfetch, read_file, write_file, delete_file, list_files, shell. Only for "
+    "current/news/search: call get_current_time then web_search with date. For hi/chat "
+    "answer directly no tools. Never output JSON as text use tool_calls. No intro/outro."
 )
 
 
@@ -141,7 +140,19 @@ class Agent:
 
     def _assistant_message(self, turn) -> dict:
         # Always set content as string - Ollama rejects null/missing content (Go <nil>)
-        msg: dict = {"role": "assistant", "content": turn.content if isinstance(turn.content, str) else ""}
+        content = turn.content if isinstance(turn.content, str) else ""
+        # If model dumped tool JSON as content but also provided tool_calls, hide the JSON
+        if turn.tool_calls and content:
+            stripped = content.strip()
+            # strip fences for check
+            import re as _re
+            fenced = _re.sub(r"^```[a-z]*\s*\n?", "", stripped, flags=_re.IGNORECASE)
+            fenced = _re.sub(r"\n?```\s*$", "", fenced).strip()
+            if fenced.startswith("{") and '"name"' in fenced and '"arguments"' in fenced:
+                content = ""
+            elif '"name"' in content and '"arguments"' in content and (content.strip().startswith("{") or content.strip().startswith("```")):
+                content = ""
+        msg: dict = {"role": "assistant", "content": content}
         if turn.tool_calls:
             msg["tool_calls"] = [
                 {

@@ -182,6 +182,14 @@ def _tag_holdback(buffer: str, in_think: bool, at_line_start: bool = False) -> i
     return 0
 
 
+def _is_tool_json_display(s: str) -> bool:
+    t = s.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-z]*\s*\n?", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"\n?```\s*$", "", t).strip()
+    return t.startswith("{") and '"name"' in t and '"arguments"' in t
+
+
 def _parse_thinking_text(text: str, state: dict[str, bool]):  # type: ignore[no-untyped-def]
     """Parse text into a Rich Text object, highlighting <think>...</think>
     and [Thinking:...] sections in italic dim cyan/gray. Lazy: returns str if rich not available."""
@@ -649,12 +657,23 @@ class TerminalHooks(Hooks):
                         self._thinking_text = self._thinking_text[-2000:]
                     self._update_header()
                 else:
+                    # hide leaked tool JSON (model dumped tool call as text)
+                    if _is_tool_json_display(joined):
+                        cur.clear()
+                        return
                     if not self._ai_prefix_printed and not self._in_think and not self._in_bracket:
                         clean_check = joined.lstrip("\r\n")
                         if clean_check:
+                            # also check after stripping AI prefix
+                            if _is_tool_json_display(clean_check):
+                                cur.clear()
+                                return
                             self._write_stdout(AI_PREFIX)
                             self._ai_prefix_printed = True
                             joined = clean_check
+                    if _is_tool_json_display(joined):
+                        cur.clear()
+                        return
                     self._tw_enqueue(joined)
                 cur.clear()
 
