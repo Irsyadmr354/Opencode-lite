@@ -231,9 +231,11 @@ class LLMClient:
                         text = delta.get("content")
                         if text:
                             content_parts.append(text)
-                            # suppress raw tool JSON from streaming to UI (will be tool_calls)
+                            # suppress raw tool JSON from streaming to UI (will be tool_calls) — aggressive
                             accum = "".join(content_parts)
-                            if _looks_like_tool_json(accum) or _looks_like_tool_json(text):
+                            if ('"name"' in text and '"arguments"' in text) or ('"name"' in accum and '"arguments"' in accum):
+                                pass  # leaked tool JSON, hide
+                            elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass  # don't yield tool JSON as visible text
                             elif accum.strip().startswith("{") and '"name"' in accum and '"arguments"' in accum:
                                 pass
@@ -278,7 +280,9 @@ class LLMClient:
                         if text:
                             content_parts.append(text)
                             accum = "".join(content_parts)
-                            if _looks_like_tool_json(accum) or _looks_like_tool_json(text):
+                            if ('"name"' in text and '"arguments"' in text) or ('"name"' in accum and '"arguments"' in accum):
+                                pass
+                            elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass
                             elif accum.strip().startswith("{") and '"name"' in accum and '"arguments"' in accum:
                                 pass

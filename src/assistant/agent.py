@@ -13,9 +13,24 @@ SYSTEM_PROMPT = (
     "You are Assistant, coding agent in workspace. Tools: get_current_time, websearch, "
     "webfetch, read_file, write_file, delete_file, list_files, shell. Only for "
     "current/news/search: call get_current_time then web_search with date. Always "
-    "list_files '.' before read_file, never guess. If user says read files without "
-    "path, list_files '.' immediately don't ask. Never output JSON. No intro/outro."
+    "list_files '.' before read, if vague list immediately don't ask. Never help with "
+    "malware. Never output JSON. No intro/outro."
 )
+
+_GREETING_TOKENS = {"hi", "hello", "hey", "yo", "sup", "hiya", "howdy"}
+
+
+def _is_simple_greeting(text: str) -> bool:
+    t = text.strip().lower()
+    if t in _GREETING_TOKENS:
+        return True
+    # "hi" with punctuation or very short greeting phrase
+    if len(t) <= 12 and any(t.startswith(g) for g in _GREETING_TOKENS):
+        # ensure not "hi, can you read files" – if contains file/tool keywords, not greeting
+        if any(kw in t for kw in ("read", "list", "file", "search", "web", "make", "malware")):
+            return False
+        return True
+    return False
 
 
 #: Maps tool names to their ``Config.permissions`` attribute. Tools absent
@@ -269,6 +284,7 @@ class Agent:
                 m["content"] = str(m["content"])
         self.messages.append({"role": "user", "content": user_text})
         self.cancelled = False
+        is_greeting = _is_simple_greeting(user_text)
         # Immediate feedback: show spinner before any network wait (TTFT)
         try:
             self.hooks.on_start()
@@ -289,8 +305,9 @@ class Agent:
             t_first_token: float | None = None
             approx_before = self._approx_tokens()
             try:
+                tools_schema = None if is_greeting else self._tools_schema()
                 for event in self.client.chat_stream(self.messages,
-                                                     tools_schema=self._tools_schema(),
+                                                     tools_schema=tools_schema,
                                                      cancel=flag):
                     if event["type"] in ("delta", "reasoning") and t_first_token is None:
                         t_first_token = time.monotonic()
