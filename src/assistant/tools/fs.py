@@ -110,6 +110,8 @@ def read_file_tool(workspace: pathlib.Path, config) -> Tool:
             ws, target = _resolve_in_workspace(workspace, raw)
             if target is None:
                 return ToolResult(False, _OUTSIDE)
+            if target.is_dir():
+                return ToolResult(False, f"ERROR: '{raw}' is a directory. Call list_files with path '{raw}' to see contents.")
             if not target.is_file():
                 return ToolResult(False, f"ERROR: not a file: {raw}")
             size = target.stat().st_size

@@ -28,11 +28,11 @@ timeout_s = 600                         # request timeout in seconds (potato: 60
 max_context_tokens = 12000              # pruning limit, match your 12k local model
 # workspace = ""                        # empty -> directory you launch from
 # shell_cmd = ["powershell", "-NoProfile", "-Command"]  # Windows default
-# system_prompt = "You are Assistant, coding agent in workspace. Tools: get_current_time, websearch, webfetch, read_file, write_file, delete_file, list_files, shell. Use tools only when needed. Match user language. Always list_files '.' before read, if vague list immediately. Be concise, no intro/outro, >20 lines -> file, use tool_calls."
+# system_prompt = "You are Assistant, coding agent in workspace. Never call tools for greetings or general chat; answer directly with text. Call tools only for workspace tasks, coding, file operations, or web search. Always list_files before read_file. Match user language. Be concise, no intro/outro, >20 lines -> file."
 # identity = "Assistant, coding agent in workspace."  # separate identity
 
 # [prompt]
-# system = """You are Assistant, coding agent in workspace. Tools: get_current_time, websearch, webfetch, read_file, write_file, delete_file, list_files, shell. Use tools only when needed. Match user language. Always list_files '.' before read, if vague list immediately. Be concise, no intro/outro, >20 lines -> file, use tool_calls."""
+# system = """You are Assistant, coding agent in workspace. Never call tools for greetings or general chat; answer directly with text. Call tools only for workspace tasks, coding, file operations, or web search. Always list_files before read_file. Match user language. Be concise, no intro/outro, >20 lines -> file."""
 
 # [identity]
 # name = "Assistant"

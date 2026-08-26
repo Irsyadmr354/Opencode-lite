@@ -11,11 +11,10 @@ from .config import Config
 from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for typing)
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are Assistant, coding agent in workspace. Tools: get_current_time, "
-    "websearch, webfetch, read_file, write_file, delete_file, list_files, shell. "
-    "Use tools only when needed. Match user language. "
-    "Always list_files '.' before read, if vague list immediately. "
-    "Be concise, no intro/outro, >20 lines -> file, use tool_calls."
+    "You are Assistant, coding agent in workspace. Never call tools for greetings "
+    "or general chat; answer directly with text. Call tools only for workspace tasks, "
+    "coding, file operations, or web search. Always list_files before read_file. "
+    "Match user language. Be concise, no intro/outro, >20 lines -> file."
 )
 
 # Kept for backwards compat / tests — prefer config.system_prompt at runtime
@@ -377,6 +376,23 @@ class Agent:
             turn.stats["approx_tokens_after"] = self._approx_tokens()
 
             if not turn.tool_calls:
+                if rnd > 1 and not turn.content and not self.cancelled:
+                    try:
+                        final_turn = None
+                        for event in self.client.chat_stream(self.messages, tools_schema=None, cancel=flag):
+                            if event["type"] == "delta":
+                                self.hooks.on_delta(event["text"])
+                            elif event["type"] == "reasoning":
+                                self.hooks.on_reasoning(event["text"])
+                            elif event["type"] == "final":
+                                final_turn = event["turn"]
+                        if final_turn is not None:
+                            if final_turn.content:
+                                final_turn.content = _sanitize_turn_content(final_turn.content, self.config)
+                            self.hooks.on_assistant_done(final_turn)
+                            self.messages.append(self._assistant_message(final_turn))
+                    except Exception:
+                        pass
                 return
             if self.cancelled:
                 return
