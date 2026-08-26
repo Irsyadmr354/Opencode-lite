@@ -1,514 +1,514 @@
-"""Offline tests: agent loop, LLM streaming client, config loading."""
+"""Tests for assistant.agent: multi-round loop, date refresh, permissions, reasoning, and tools."""
 
-from __future__ import annotations
-
+import io
 import json
+import pathlib
 import sys
-from pathlib import Path
-
+import unittest.mock as mock
+from datetime import datetime, timezone
 import pytest
 
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-for _p in (str(_ROOT / "src"), str(_HERE)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from fake_ollama import FakeOllama  # noqa: E402
-
-from assistant.agent import SYSTEM_PROMPT, Agent, Hooks  # noqa: E402
-from assistant.config import Config, load_config  # noqa: E402
-from assistant.llm import LLMClient, LLMError  # noqa: E402
-
-
-# --- helpers -----------------------------------------------------------------
-
-class StubTool:
-    """Duck-typed tool recording calls; returns ok/output like the real ones."""
-
-    def __init__(self, name: str = "echo", danger: bool = False, raises: bool = False):
-        self.name = name
-        self.description = "stub tool for tests"
-        self.parameters = {"type": "object", "properties": {}, "required": []}
-        self.danger = danger
-        self.raises = raises
-        self.calls: list[dict] = []
-
-    def fn(self, args: dict) -> dict:
-        self.calls.append(dict(args))
-        if self.raises:
-            raise RuntimeError("boom")
-        return {"ok": True, "output": "ran:" + json.dumps(args, sort_keys=True)}
+from assistant.agent import (
+    CHAR_DELAY,
+    Agent,
+    ThinkingSpinner,
+    _char_by_char,
+    _get_live_datetime_str,
+    build_system_prompt,
+)
+from assistant.config import Config, Limits, Permissions
+from assistant.tools import Tool, ToolResult
 
 
-class RecordingHooks(Hooks):
-    def __init__(self, allow: bool = True):
-        super().__init__()
-        self.allow = allow
-        self.deltas: list[str] = []
-        self.turns: list = []
-        self.statuses: list[dict] = []
-        self.errors: list[str] = []
-        self.permission_requests: list[tuple[str, dict]] = []
-        self.cancel_after_done = 0  # >0: cancel agent after N assistant turns
-        self.agent_ref: dict = {}
-
-    def on_delta(self, text: str) -> None:
-        self.deltas.append(text)
-
-    def on_assistant_done(self, turn) -> None:
-        self.turns.append(turn)
-        if self.cancel_after_done and len(self.turns) >= self.cancel_after_done:
-            self.agent_ref["agent"].cancelled = True
-
-    def on_permission(self, name: str, args: dict) -> bool:
-        self.permission_requests.append((name, dict(args)))
-        return self.allow
-
-    def on_status(self, info: dict) -> None:
-        self.statuses.append(dict(info))
-
-    def on_error(self, msg: str) -> None:
-        self.errors.append(msg)
+# --- 1. System Prompt & Live Datetime Tests ---
 
 
-CONTENT_REPLY = {"content": "Hello from the fake model.", "finish_reason": "stop"}
+def test_get_live_datetime_str():
+    dt_str = _get_live_datetime_str()
+    assert str(datetime.now().year) in dt_str
 
 
-def tool_call_reply(name: str, args: dict | None = None, call_id: str = "call_42") -> dict:
-    return {
-        "content": None,
-        "tool_calls": [{
-            "id": call_id,
-            "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args or {})},
-        }],
-        "finish_reason": "tool_calls",
-    }
+def test_build_system_prompt_date_and_workspace():
+    prompt = build_system_prompt("/test/workspace")
+    assert "/test/workspace" in prompt
+    assert "get_current_time" in prompt
+    assert "websearch" in prompt
+    assert "webfetch" in prompt
+    assert "Assistant" in prompt
 
 
-@pytest.fixture
-def harness():
-    servers: list[FakeOllama] = []
+def test_system_prompt_refreshed_on_every_turn(tmp_path):
+    cfg = Config(workspace=tmp_path)
+    agent = Agent(cfg)
 
-    def make(script, tools=(), hooks=None, max_tool_rounds: int = 25) -> Agent:
-        srv = FakeOllama(script)
-        srv.start()
-        servers.append(srv)
-        client = LLMClient(base_url=srv.base_url, api_key="ollama",
-                           model="fake-model", timeout_s=10)
-        cfg = Config(max_tool_rounds=max_tool_rounds)
-        return Agent(client=client, tools=list(tools), config=cfg, hooks=hooks)
-
-    make.servers = servers  # expose for client-received payload inspection
-    yield make
-    for srv in servers:
-        srv.shutdown()
-
-
-# --- agent loop ---------------------------------------------------------------
-
-def test_plain_reply(harness):
-    hooks = RecordingHooks()
-    agent = harness([CONTENT_REPLY], hooks=hooks)
-
-    agent.submit("hi there")
-
-    assert [m["role"] for m in agent.messages] == ["system", "user", "assistant"]
-    assert agent.messages[1] == {"role": "user", "content": "hi there"}
-    assert agent.messages[2]["content"] == "Hello from the fake model."
-    assert "tool_calls" not in agent.messages[2]
-    assert "".join(hooks.deltas) == "Hello from the fake model."
-    assert len(hooks.deltas) >= 2, "deltas must arrive incrementally (>=2 chunks)"
-    assert len(hooks.turns) == 1
-    assert hooks.turns[0].finish_reason == "stop"
-    assert hooks.errors == []
-
-
-def test_tool_roundtrip(harness):
-    echo = StubTool(name="echo")
-    hooks = RecordingHooks()
-    agent = harness([tool_call_reply("echo", {"msg": "ping"}), CONTENT_REPLY],
-                    tools=[echo], hooks=hooks)
-
-    agent.submit("please echo")
-
-    assert echo.calls == [{"msg": "ping"}], "fn must receive parsed args dict"
-    assistants = [m for m in agent.messages if m["role"] == "assistant"]
-    assert len(assistants) == 2
-    assert assistants[0]["tool_calls"][0]["id"] == "call_42"
-    assert json.loads(assistants[0]["tool_calls"][0]["function"]["arguments"]) == {"msg": "ping"}
-    assert assistants[1]["content"] == "Hello from the fake model."
-    assert assistants[1].get("tool_calls") is None and "tool_calls" not in assistants[1]
-    tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
-    assert len(tool_msgs) == 1
-    assert tool_msgs[0]["tool_call_id"] == "call_42"
-    assert "ping" in tool_msgs[0]["content"]
-    assert hooks.errors == []
-
-
-def test_danger_denied(harness):
-    guard = StubTool(name="guard", danger=True)
-    hooks = RecordingHooks(allow=False)
-    agent = harness([tool_call_reply("guard", {"path": "x.txt"}), CONTENT_REPLY],
-                    tools=[guard], hooks=hooks)
-
-    agent.submit("delete stuff")
-
-    tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
-    assert len(tool_msgs) == 1
-    assert tool_msgs[0]["content"] == "DENIED by user"
-    assert guard.calls == [], "denied tools must not execute"
-    assert hooks.permission_requests == [("guard", {"path": "x.txt"})]
-    assert hooks.turns[-1].content == "Hello from the fake model."  # loop continued
-    assert hooks.errors == []
-
-
-def test_unknown_tool(harness):
-    hooks = RecordingHooks()
-    agent = harness([tool_call_reply("nope", {"a": 1}), CONTENT_REPLY],
-                    tools=[], hooks=hooks)
-
-    agent.submit("do it")
-
-    tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
-    assert len(tool_msgs) == 1
-    assert "unknown tool" in tool_msgs[0]["content"]
-    assert hooks.errors == []
-
-
-def test_cancel(harness):
-    hooks = RecordingHooks()
-    hooks.cancel_after_done = 1
-    # single entry repeats forever -> infinite tool-calling script
-    agent = harness([tool_call_reply("echo", {"n": 1})],
-                    tools=[StubTool(name="echo")], hooks=hooks,
-                    max_tool_rounds=50)
-    hooks.agent_ref["agent"] = agent
-
-    agent.submit("loop forever")  # must return without raising or error spam
-
-    assert agent.cancelled is True
-    assert len(hooks.turns) == 1, "loop must stop right after round 1"
-    assistants = [m for m in agent.messages if m["role"] == "assistant"]
-    assert len(assistants) == 1
-    assert all(m["role"] != "tool" for m in agent.messages), "no tools ran post-cancel"
-    assert hooks.errors == [], "cancel must not trigger on_error"
-
-
-def test_tool_exception_becomes_error_message(harness):
-    broken = StubTool(name="broken", raises=True)
-    hooks = RecordingHooks()
-    agent = harness([tool_call_reply("broken", {}), CONTENT_REPLY],
-                    tools=[broken], hooks=hooks)
-
-    agent.submit("crash it")
-
-    tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
-    assert tool_msgs[0]["content"].startswith("ERROR: ")
-    assert "boom" in tool_msgs[0]["content"]
-    assert hooks.errors == []
-
-
-def test_system_prompt_contract():
-    assert "Assistant" in SYSTEM_PROMPT
-    assert "workspace" in SYSTEM_PROMPT
-    assert len(SYSTEM_PROMPT.split()) < 50
-
-
-def test_llm_error_cleans_unfulfilled_user_message(harness):
-    hooks = RecordingHooks()
-    # Script that raises 500 error on chat_stream
-    agent = harness([{"status": 500, "body": '{"error":"fail"}'}], hooks=hooks)
-    agent.submit("failed prompt")
-    assert hooks.errors != []
-    # User message must have been popped so state is not corrupted
-    assert [m["role"] for m in agent.messages] == ["system"]
-
-
-# --- context pruning (exercised end-to-end through submit) ---------------------
-
-def _assert_api_valid_shape(messages: list[dict]) -> None:
-    """No role:'tool' message may lack its assistant(tool_calls) parent."""
-    for i, message in enumerate(messages):
-        if message.get("role") == "tool":
-            prev = messages[i - 1] if i else None
-            assert (prev is not None and prev.get("role") == "assistant"
-                    and prev.get("tool_calls")), f"orphaned tool message at index {i}"
-
-
-def test_context_pruning(harness):
-    hooks = RecordingHooks()
-    agent = harness([CONTENT_REPLY], hooks=hooks)
-    agent.messages = [{"role": "system", "content": "system"}]
-    for i in range(40):
-        agent.messages.append({"role": "user", "content": f"OLD_USER_{i} " + "x" * 2000})
-        agent.messages.append({"role": "assistant", "content": f"OLD_ASSIST_{i} " + "y" * 2000})
-    assert agent._approx_tokens() > 32000
-
-    agent.submit("fresh question")
-
-    assert agent.messages[0] == {"role": "system", "content": "system"}
-    _assert_api_valid_shape(agent.messages)
-    assert agent._approx_tokens() <= 33000, "history must be pruned to the budget"
-    flat = json.dumps(agent.messages)
-    assert "OLD_USER_0" not in flat and "OLD_ASSIST_0" not in flat, "oldest turns pruned"
-    assert "fresh question" in flat, "newest user turn must survive"
-    assert agent.messages[-2] == {"role": "user", "content": "fresh question"}
-    assert agent.messages[-1]["content"] == "Hello from the fake model."
-    assert hooks.errors == []
-
-
-def test_pruning_keeps_tool_pair_atomic(harness):
-    """Pruning must remove assistant(tool_calls)+tool results as ONE unit so
-    no orphaned tool message ever reaches an OpenAI-compatible server."""
-    echo = StubTool(name="echo")
-    hooks = RecordingHooks()
-    agent = harness([CONTENT_REPLY], tools=[echo], hooks=hooks)
-    pad = json.dumps({"pad": "P" * 30000})
-    agent.messages = [
-        {"role": "system", "content": "system"},
-        {"role": "assistant",
-         "content": None,
-         "tool_calls": [{"id": "call_old", "type": "function",
-                         "function": {"name": "echo", "arguments": pad}}]},
-        {"role": "tool", "tool_call_id": "call_old", "content": "R" * 30000},
-    ]
-    for i in range(12):
-        agent.messages.append({"role": "user", "content": f"FILLER_U_{i} " + "f" * 4000})
-        agent.messages.append({"role": "assistant", "content": f"FILLER_A_{i} " + "g" * 4000})
-    assert agent._approx_tokens() > 32000
-
-    agent.submit("and now?")
-
-    _assert_api_valid_shape(agent.messages)
-    flat = json.dumps(agent.messages)
-    assert '"call_old"' not in flat and '"RRR' not in flat, \
-        "assistant(tool_calls) and its tool result must vanish atomically"
-    assert agent._approx_tokens() <= 34000, "pruning must have run to the budget"
+    # Initial prompt
+    assert len(agent.messages) == 1
     assert agent.messages[0]["role"] == "system"
-    assert agent.messages[-2] == {"role": "user", "content": "and now?"}
-    assert agent.messages[-1]["content"] == "Hello from the fake model."
-    assert echo.calls == [], "scripted reply only; no tool may fire during submit"
-    assert hooks.errors == []
+    assert str(tmp_path) in agent.messages[0]["content"]
+
+    # Workspace change is refreshed on turn
+    new_ws = tmp_path / "new_workspace"
+    agent.workspace = new_ws
+    with mock.patch.object(agent.llm, "chat", return_value={"content": "Hello!", "tool_calls": []}):
+        agent.handle("hi")
+
+    assert str(new_ws) in agent.messages[0]["content"]
 
 
-# --- inline <think> stripping from stored history -------------------------------
+def test_clear_context_resets_history_and_refreshes_prompt(tmp_path):
+    cfg = Config(workspace=tmp_path)
+    agent = Agent(cfg)
 
-@pytest.mark.parametrize("raw,expected_content,expected_reasoning", [
-    ("<think>secret</think>answer", "answer", "secret"),
-    ("A<think>x</think>B", "AB", "x"),
-    ("<think>leaked tail", None, "leaked tail"),          # unclosed trailing opener
-    ("[thinking: quick look]Ready.", "Ready.", "quick look"),
-    ("<THINK>case</THINK>ok", "ok", "case"),
-    ("just text", "just text", None),
-])
-def test_inline_thinking_split(harness, raw, expected_content, expected_reasoning):
-    hooks = RecordingHooks()
-    agent = harness([{"content": raw, "finish_reason": "stop"}], hooks=hooks)
+    agent.messages.append({"role": "user", "content": "test"})
+    agent.messages.append({"role": "assistant", "content": "response"})
+    agent._recent_calls.append("call1")
 
-    agent.submit("go")
+    agent.clear_context()
 
-    turn = hooks.turns[0]
-    assert turn.content == expected_content
-    assert turn.reasoning == expected_reasoning
-    # Wire format must never be null (Go <nil>) - empty string is used instead
-    expected_msg = expected_content if expected_content is not None else ""
-    assert agent.messages[-1].get("content") == expected_msg
-    assert "<think>" not in json.dumps(agent.messages)
+    assert len(agent.messages) == 1
+    assert agent.messages[0]["role"] == "system"
+    assert str(tmp_path) in agent.messages[0]["content"]
+    assert len(agent._recent_calls) == 0
 
 
-def test_think_tags_stripped_from_replayed_history(harness):
-    hooks = RecordingHooks()
-    think_reply = {"content": "<think>secret plan</think>The answer is 42.",
-                   "finish_reason": "stop"}
-    agent = harness([think_reply, CONTENT_REPLY], hooks=hooks)
-
-    agent.submit("question one")
-    agent.submit("question two")
-
-    # Round 2 request payload as received by the fake server
-    replay = harness.servers[-1].last_request["messages"]
-    assert hooks.turns[0].content == "The answer is 42."
-    assert hooks.turns[0].reasoning == "secret plan"
-    assert agent.messages[2]["content"] == "The answer is 42."
-    assert "<think>" not in json.dumps(replay), "clean history must be replayed"
-    assert "secret plan" not in json.dumps(replay)
-    assert hooks.errors == []
+# --- 2. Date Requirement in Prompt and Tool Specs ---
 
 
-def test_native_reasoning_field_wins_over_inline_think(harness):
-    hooks = RecordingHooks()
-    agent = harness([{"reasoning": "native thought",
-                      "content": "<think>junk</think>final",
-                      "finish_reason": "stop"}], hooks=hooks)
+def test_date_requirement_in_prompt_and_all_tools(tmp_path):
+    cfg = Config(workspace=tmp_path)
+    agent = Agent(cfg)
 
-    agent.submit("go")
+    # Rule in system prompt
+    sys_prompt = agent.messages[0]["content"]
+    assert "get_current_time" in sys_prompt
+    assert "websearch" in sys_prompt or "webfetch" in sys_prompt
 
-    assert hooks.turns[0].reasoning == "native thought"
-    assert hooks.turns[0].content == "final"
-    assert "junk" not in json.dumps(agent.messages), \
-        "inline think text discarded when native reasoning exists"
+    # Tool descriptions
+    websearch = agent.tool_map["websearch"]
+    webfetch = agent.tool_map["webfetch"]
+    get_time = agent.tool_map["get_current_time"]
 
-
-# --- llm client -----------------------------------------------------------------
-
-def test_llm_error_on_unreachable_server():
-    srv = FakeOllama([])
-    _, port = srv.start()
-    srv.shutdown()
-    client = LLMClient(base_url=f"http://127.0.0.1:{port}/v1", api_key="k",
-                       model="m", timeout_s=5)
-    with pytest.raises(LLMError):
-        list(client.chat_stream([{"role": "user", "content": "hi"}]))
+    assert "get_current_time" in websearch.description
+    assert "get_current_time" in webfetch.description
+    assert "websearch" in get_time.description or "webfetch" in get_time.description
 
 
-def test_llm_error_on_http_status():
-    srv = FakeOllama([{"status": 500, "body": '{"error":"kaboom"}'}])
-    srv.start()
-    try:
-        client = LLMClient(base_url=srv.base_url, api_key="k", model="m", timeout_s=5)
-        with pytest.raises(LLMError) as excinfo:
-            list(client.chat_stream([{"role": "user", "content": "hi"}]))
-        assert "500" in str(excinfo.value)
-        assert "kaboom" in str(excinfo.value)
-    finally:
-        srv.shutdown()
+# --- 3. Multi-Round Agent Execution Tests ---
 
 
-# --- config ----------------------------------------------------------------------
+def test_multi_round_execution_tool_call_then_final_response(tmp_path):
+    cfg = Config(workspace=tmp_path, stream=False)
+    agent = Agent(cfg)
 
-def test_load_config_toml(tmp_path, monkeypatch):
-    monkeypatch.delenv("OCLITE_MODEL", raising=False)
-    monkeypatch.delenv("OCLITE_BASE_URL", raising=False)
+    # Create a test file
+    test_file = tmp_path / "hello.txt"
+    test_file.write_text("file content 42", encoding="utf-8")
 
-    cfg_file = tmp_path / "oclite.toml"
-    cfg_file.write_text(
-        'model = "llama3:8b"\n'
-        "max_tool_rounds = 7\n"
-        "\n[limits]\n"
-        "read_max_lines = 50\n"
-        "\n[permissions]\n"
-        'shell = "allow"\n',
-        encoding="utf-8",
-    )
-
-    cfg = load_config(cfg_file)
-    assert cfg.model == "llama3:8b"
-    assert cfg.max_tool_rounds == 7
-    assert cfg.limits.read_max_lines == 50
-    assert cfg.limits.shell_timeout_s == 120, "untouched limits keep defaults"
-    assert cfg.permissions.shell == "allow"
-    assert cfg.permissions.delete == "ask", "untouched permissions keep defaults"
-    assert cfg.workspace == Path.cwd()
-    assert cfg.stream is True
-
-    monkeypatch.setenv("OCLITE_MODEL", "env-model")
-    assert load_config(cfg_file).model == "env-model", "env overrides file"
-
-    overrides = {"model": "override-model"}
-    assert load_config(cfg_file, overrides).model == "override-model"
-
-    with pytest.raises(ValueError):
-        load_config(None, {"not_a_real_key": 1})
-
-
-def test_tool_syntax_sanitized_from_content(harness):
-    hooks = RecordingHooks()
-    leak_reply = {"content": ">tool_calls [echo] hello", "finish_reason": "stop"}
-    echo_tool = StubTool(name="echo")
-    agent = harness([leak_reply, CONTENT_REPLY], tools=[echo_tool], hooks=hooks)
-    agent.submit("do echo")
-
-    assert len(echo_tool.calls) == 1
-    assert ">tool_calls" not in agent.messages[-1]["content"]
-
-
-def test_truncated_tool_json_fallback(harness):
-    write_tool = StubTool(name="write_file")
-    hooks = RecordingHooks()
-    truncated_reply = {
-        "content": '```json\n{"name": "write_file", "arguments": {"path": "sample.txt", "content": "hello"',
-        "finish_reason": "stop",
-    }
-    agent = harness([truncated_reply, CONTENT_REPLY], tools=[write_tool], hooks=hooks)
-    agent.submit("create file")
-
-    assert len(write_tool.calls) == 1
-    assert write_tool.calls[0]["path"] == "sample.txt"
-    assert write_tool.calls[0]["content"] == "hello"
-
-
-def test_tools_xml_fallback_and_persona_sanitization(harness):
-    time_tool = StubTool(name="get_current_time")
-    hooks = RecordingHooks()
-    tools_reply = {
-        "content": '<tools>\n{"type": "function", "function": {"name": "get_current_time", "arguments": {}}}\n</tools>',
-        "finish_reason": "stop",
-    }
-    claude_reply = {
-        "content": "I'm a large language model called Claude created by Anthropic.",
-        "finish_reason": "stop",
-    }
-    agent = harness([tools_reply, claude_reply], tools=[time_tool], hooks=hooks)
-    agent.submit("what time is it?")
-
-    assert len(time_tool.calls) == 1
-    final_content = agent.messages[-1]["content"]
-    assert "Claude" not in final_content
-    assert "Anthropic" not in final_content
-    assert "Assistant" in final_content
-
-
-def test_nested_arguments_unwrapped(harness):
-    read_tool = StubTool(name="read_file")
-    hooks = RecordingHooks()
-    nested_reply = {
-        "tool_calls": [
-            {
-                "id": "call_0",
-                "type": "function",
-                "function": {
+    # Round 1: LLM decides to call read_file
+    # Round 2: LLM receives tool output and responds with final answer
+    llm_responses = [
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_read_1",
                     "name": "read_file",
-                    "arguments": '{"arguments": {"arguments": {"path": "./time_info.txt", "start_line": 1}}}',
-                },
-            }
-        ],
+                    "arguments": {"path": "hello.txt"},
+                }
+            ],
+            "finish_reason": "tool_calls",
+            "thinking": "Need to read file first",
+        },
+        {
+            "content": "The file contains: file content 42",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "thinking": "Now I can answer",
+        },
+    ]
+
+    with mock.patch.object(agent.llm, "chat", side_effect=llm_responses) as mock_chat:
+        resp = agent.handle("Read hello.txt")
+
+    assert mock_chat.call_count == 2
+    assert resp == "The file contains: file content 42"
+
+    # Verify conversation history structure
+    # 0: system, 1: user, 2: assistant (tool call), 3: tool result, 4: assistant (final)
+    assert len(agent.messages) == 5
+    assert agent.messages[1]["role"] == "user"
+    assert agent.messages[1]["content"] == "Read hello.txt"
+
+    assert agent.messages[2]["role"] == "assistant"
+    assert agent.messages[2]["tool_calls"][0]["function"]["name"] == "read_file"
+
+    assert agent.messages[3]["role"] == "tool"
+    assert "file content 42" in agent.messages[3]["content"]
+    assert agent.messages[3]["tool_call_id"] == "call_read_1"
+
+    assert agent.messages[4]["role"] == "assistant"
+    assert agent.messages[4]["content"] == "The file contains: file content 42"
+
+
+def test_multi_round_execution_multiple_tools(tmp_path):
+    cfg = Config(workspace=tmp_path, stream=False)
+    agent = Agent(cfg)
+
+    llm_responses = [
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_time_1",
+                    "name": "get_current_time",
+                    "arguments": {},
+                }
+            ],
+            "finish_reason": "tool_calls",
+        },
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_write_1",
+                    "name": "write_file",
+                    "arguments": {"path": "log.txt", "content": "logged"},
+                }
+            ],
+            "finish_reason": "tool_calls",
+        },
+        {
+            "content": "Successfully checked time and wrote log.",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        },
+    ]
+
+    with mock.patch.object(agent.llm, "chat", side_effect=llm_responses) as mock_chat:
+        resp = agent.handle("Get time and log it")
+
+    assert mock_chat.call_count == 3
+    assert resp == "Successfully checked time and wrote log."
+    assert (tmp_path / "log.txt").read_text(encoding="utf-8") == "logged"
+
+
+def test_max_rounds_limit(tmp_path):
+    cfg = Config(workspace=tmp_path, max_rounds=2, stream=False)
+    agent = Agent(cfg)
+
+    infinite_tool_calls = {
+        "content": "still working...",
+        "tool_calls": [{"id": "call_inf", "name": "get_current_time", "arguments": {}}],
         "finish_reason": "tool_calls",
     }
-    agent = harness([nested_reply, CONTENT_REPLY], tools=[read_tool], hooks=hooks)
-    agent.submit("read file")
 
-    assert len(read_tool.calls) == 1
-    assert read_tool.calls[0]["path"] == "./time_info.txt"
-    assert read_tool.calls[0]["start_line"] == 1
+    with mock.patch.object(agent.llm, "chat", return_value=infinite_tool_calls) as mock_chat:
+        resp = agent.handle("Infinite loop test")
+
+    assert mock_chat.call_count == 2
+    assert resp == "still working..."
 
 
-def test_raw_tool_typo_and_leading_arrow_fallback(harness):
-    time_tool = StubTool(name="get_current_time")
-    hooks = RecordingHooks()
-    leak_reply = {
-        "content": '>{"naame": "get_current_time", "arguments',
+def test_consecutive_identical_tool_call_loop_breaker(tmp_path):
+    cfg = Config(workspace=tmp_path, stream=False)
+    agent = Agent(cfg)
+
+    identical_call = {
+        "content": "",
+        "tool_calls": [{"id": "call_same", "name": "get_current_time", "arguments": {}}],
+        "finish_reason": "tool_calls",
+    }
+    final_resp = {
+        "content": "Stopped loop.",
+        "tool_calls": [],
         "finish_reason": "stop",
     }
-    agent = harness([leak_reply, CONTENT_REPLY], tools=[time_tool], hooks=hooks)
-    agent.submit("hi")
 
-    assert len(time_tool.calls) == 1
-    assert "naame" not in agent.messages[-1]["content"]
+    with mock.patch.object(agent.llm, "chat", side_effect=[identical_call, identical_call, identical_call, final_resp]):
+        resp = agent.handle("Repeat test")
+
+    assert resp == "Stopped loop."
+    tool_messages = [m for m in agent.messages if m.get("role") == "tool"]
+    assert any("Loop breaker" in m["content"] or "3 times in a row" in m["content"] for m in tool_messages)
 
 
-def test_repeated_tool_call_loop_breaker(harness):
-    time_tool = StubTool(name="get_current_time")
-    hooks = RecordingHooks()
-    time_call = {
-        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_current_time", "arguments": "{}"}}],
+def test_unknown_tool_handling(tmp_path):
+    cfg = Config(workspace=tmp_path, stream=False)
+    agent = Agent(cfg)
+
+    unknown_call = {
+        "content": "",
+        "tool_calls": [{"id": "call_unk", "name": "non_existent_tool", "arguments": {"foo": "bar"}}],
         "finish_reason": "tool_calls",
     }
-    final_reply = {"content": "Hello! It is currently 2026.", "finish_reason": "stop"}
-    # Model attempts to repeat get_current_time on turn 2; loop breaker breaks it and asks for final_reply
-    agent = harness([time_call, time_call, final_reply], tools=[time_tool], hooks=hooks)
-    agent.submit("hi")
+    final_resp = {
+        "content": "Handled unknown tool.",
+        "tool_calls": [],
+        "finish_reason": "stop",
+    }
 
-    assert len(time_tool.calls) == 1
-    assert "Hello" in agent.messages[-1]["content"]
+    with mock.patch.object(agent.llm, "chat", side_effect=[unknown_call, final_resp]):
+        resp = agent.handle("Run unknown")
+
+    assert resp == "Handled unknown tool."
+    tool_msg = next(m for m in agent.messages if m.get("role") == "tool")
+    assert "Unknown tool" in tool_msg["content"]
+
+
+# --- 4. Permission Gating in Agent Loop ---
+
+
+def test_permission_allow_executes_silently(tmp_path):
+    cfg = Config(workspace=tmp_path, permissions=Permissions(shell="allow"), stream=False)
+    agent = Agent(cfg)
+
+    call = {
+        "content": "",
+        "tool_calls": [{"id": "call_sh", "name": "shell", "arguments": {"command": "echo allow_test"}}],
+    }
+    final_resp = {"content": "Done shell.", "tool_calls": []}
+
+    with mock.patch.object(agent.llm, "chat", side_effect=[call, final_resp]):
+        resp = agent.handle("Run shell")
+
+    assert resp == "Done shell."
+    tool_msg = next(m for m in agent.messages if m.get("role") == "tool")
+    assert "allow_test" in tool_msg["content"]
+
+
+def test_permission_deny_blocks_execution(tmp_path):
+    cfg = Config(workspace=tmp_path, permissions=Permissions(shell="deny"), stream=False)
+    agent = Agent(cfg)
+
+    call = {
+        "content": "",
+        "tool_calls": [{"id": "call_sh", "name": "shell", "arguments": {"command": "echo should_not_run"}}],
+    }
+    final_resp = {"content": "Understood denial.", "tool_calls": []}
+
+    with mock.patch.object(agent.llm, "chat", side_effect=[call, final_resp]):
+        resp = agent.handle("Run shell")
+
+    assert resp == "Understood denial."
+    tool_msg = next(m for m in agent.messages if m.get("role") == "tool")
+    assert "Permission denied for 'shell'" in tool_msg["content"]
+
+
+def test_permission_ask_user_accepts(tmp_path):
+    cfg = Config(workspace=tmp_path, permissions=Permissions(delete="ask"), stream=False)
+    agent = Agent(cfg)
+
+    (tmp_path / "target.txt").write_text("delete this")
+
+    call = {
+        "content": "",
+        "tool_calls": [{"id": "call_del", "name": "delete_file", "arguments": {"path": "target.txt"}}],
+    }
+    final_resp = {"content": "Deleted file.", "tool_calls": []}
+
+    with mock.patch("builtins.input", return_value="y"), \
+         mock.patch.object(agent.llm, "chat", side_effect=[call, final_resp]):
+        resp = agent.handle("Delete target.txt")
+
+    assert resp == "Deleted file."
+    assert not (tmp_path / "target.txt").exists()
+
+
+def test_permission_ask_user_declines(tmp_path):
+    cfg = Config(workspace=tmp_path, permissions=Permissions(delete="ask"), stream=False)
+    agent = Agent(cfg)
+
+    (tmp_path / "target.txt").write_text("keep this")
+
+    call = {
+        "content": "",
+        "tool_calls": [{"id": "call_del", "name": "delete_file", "arguments": {"path": "target.txt"}}],
+    }
+    final_resp = {"content": "Cancelled delete.", "tool_calls": []}
+
+    with mock.patch("builtins.input", return_value="n"), \
+         mock.patch.object(agent.llm, "chat", side_effect=[call, final_resp]):
+        resp = agent.handle("Delete target.txt")
+
+    assert resp == "Cancelled delete."
+    assert (tmp_path / "target.txt").exists()
+
+
+# --- 5. Streaming & Reasoning Display ---
+
+
+def test_agent_streaming_mode(tmp_path):
+    cfg = Config(workspace=tmp_path, stream=True)
+    agent = Agent(cfg)
+
+    def mock_chat_stream(messages, tools=None, on_delta=None):
+        if on_delta:
+            on_delta("Thinking step 1... ", True)
+            on_delta("Here is answer.", False)
+        return {
+            "content": "Here is answer.",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "thinking": "Thinking step 1... ",
+        }
+
+    with mock.patch.object(agent.llm, "chat", side_effect=mock_chat_stream):
+        resp = agent.handle("What is 1+1?")
+
+    assert resp == "Here is answer."
+
+
+def test_agent_thinking_flow_reasoning_and_completion(tmp_path):
+    cfg = Config(workspace=tmp_path, stream=True)
+    agent = Agent(cfg)
+
+    def mock_stream(messages, tools=None, on_delta=None):
+        if on_delta:
+            on_delta("Analyzing query deeply...", True)
+            on_delta("The computed result is 42.", False)
+        return {
+            "content": "The computed result is 42.",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "thinking": "Analyzing query deeply...",
+        }
+
+    fake_out = io.StringIO()
+    with mock.patch("sys.stdout", fake_out), \
+         mock.patch.object(agent.llm, "chat", side_effect=mock_stream):
+        resp = agent.handle("Compute answer")
+
+    output = fake_out.getvalue()
+    assert resp == "The computed result is 42."
+    assert "Thinking:" in output
+    assert "Analyzing query deeply..." in output
+    assert "✔" in output and "Thinking" in output
+    assert "Assistant:" in output
+    assert "The computed result is 42." in output
+
+
+def test_agent_non_reasoning_direct_response(tmp_path):
+    cfg = Config(workspace=tmp_path, stream=True)
+    agent = Agent(cfg)
+
+    def mock_stream(messages, tools=None, on_delta=None):
+        if on_delta:
+            on_delta("Direct greeting without thinking.", False)
+        return {
+            "content": "Direct greeting without thinking.",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "thinking": "",
+        }
+
+    fake_out = io.StringIO()
+    with mock.patch("sys.stdout", fake_out), \
+         mock.patch.object(agent.llm, "chat", side_effect=mock_stream):
+        resp = agent.handle("hello")
+
+    output = fake_out.getvalue()
+    assert resp == "Direct greeting without thinking."
+    assert "Thinking:" not in output
+    assert "✔" not in output
+    assert "Assistant:" in output
+    assert "Direct greeting without thinking." in output
+
+
+def test_agent_multi_round_tool_turns_with_thinking(tmp_path):
+    cfg = Config(workspace=tmp_path, stream=True)
+    agent = Agent(cfg)
+
+    def mock_round_1(messages, tools=None, on_delta=None):
+        if on_delta:
+            on_delta("Checking time tool first...", True)
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_time_r1",
+                    "name": "get_current_time",
+                    "arguments": {},
+                }
+            ],
+            "finish_reason": "tool_calls",
+            "thinking": "Checking time tool first...",
+        }
+
+    def mock_round_2(messages, tools=None, on_delta=None):
+        if on_delta:
+            on_delta("Synthesizing current time...", True)
+            on_delta("The current date is available.", False)
+        return {
+            "content": "The current date is available.",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "thinking": "Synthesizing current time...",
+        }
+
+    call_count = 0
+
+    def mock_chat(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return mock_round_1(*args, **kwargs)
+        return mock_round_2(*args, **kwargs)
+
+    fake_out = io.StringIO()
+    with mock.patch("sys.stdout", fake_out), \
+         mock.patch.object(agent.llm, "chat", side_effect=mock_chat):
+        resp = agent.handle("What is the date?")
+
+    output = fake_out.getvalue()
+    assert resp == "The current date is available."
+    # Both thinking rounds should have executed
+    assert "Thinking: Checking time tool first..." in output
+    assert "Thinking: Synthesizing current time..." in output
+    assert "get_current_time" in output
+    assert "Assistant:" in output
+    assert "The current date is available." in output
+
+
+def test_thinking_spinner_lifecycle():
+    spinner = ThinkingSpinner(prompt_prefix="")
+    spinner.start()
+    assert spinner._started is True
+    spinner.stop()
+    assert spinner._stopped is True
+
+    # Double start/stop safe
+    spinner.start()
+    spinner.stop()
+
+
+def test_char_by_char_helper():
+    out = io.StringIO()
+    with mock.patch("sys.stdout", out):
+        _char_by_char("hi", delay=0.001)
+    assert out.getvalue() == "hi"
+
+
+def test_agent_non_streaming_thinking_lifecycle(tmp_path):
+    cfg = Config(workspace=tmp_path, stream=False)
+    agent = Agent(cfg)
+
+    mock_resp = {
+        "content": "Direct 42 answer.",
+        "tool_calls": [],
+        "finish_reason": "stop",
+        "thinking": "Deep thinking in non-streaming mode.",
+    }
+
+    fake_out = io.StringIO()
+    with mock.patch.object(agent.llm, "chat", return_value=mock_resp), \
+         mock.patch("sys.stdout", fake_out):
+        resp = agent.handle("What is the meaning of life?")
+
+    assert resp == "Direct 42 answer."
+    output = fake_out.getvalue()
+    assert "Thinking: Deep thinking in non-streaming mode." in output
+    assert "Thought in" in output
+    assert "Assistant:" in output
+    assert "Direct 42 answer." in output
+
+

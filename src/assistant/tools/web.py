@@ -10,6 +10,7 @@ import pathlib
 import re
 import socket
 import urllib.parse
+from datetime import datetime, timezone
 
 import httpx
 from bs4 import BeautifulSoup
@@ -19,7 +20,18 @@ from assistant.tools import Tool, ToolResult
 try:  # optional runtime dependency; missing ddgs must not break tool loading
     from ddgs import DDGS
 except ImportError:  # pragma: no cover - exercised only without the package
-    DDGS = None  # type: ignore[assignment]
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        DDGS = None  # type: ignore[assignment]
+
+
+def _date_context_header() -> str:
+    return (
+        f"[context: current datetime {datetime.now(timezone.utc).isoformat()} | "
+        f"today = {datetime.now().strftime('%Y-%m-%d')}; prefer sources/results dated closest to this date]"
+    )
+
 
 _USER_AGENT = "Mozilla/5.0 (compatible; assistant/0.1)"
 _FETCH_TIMEOUT_S = 30
@@ -27,6 +39,11 @@ _MAX_REDIRECT_HOPS = 5
 _MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 # Read slightly past max_chars so HTML stripping still leaves enough text.
 _OVERSHOOT_CHARS = 4096
+# Model-supplied max_chars is clamped into this window; config default is trusted.
+_MIN_FETCH_CHARS = 100
+_MAX_FETCH_CHARS = 50000
+_SEARCH_TIMEOUT_S = 20
+_RECENCY_TO_TIMELIMIT = {"day": "d", "week": "w", "month": "m", "year": "y"}
 
 
 def _host_blocked_reason(host: str) -> str | None:
@@ -81,12 +98,27 @@ def _hop_blocked_reason(url: str) -> str | None:
     return _host_blocked_reason(parts.hostname or "")
 
 
+def _safe_url(url: str) -> str:
+    """Scheme://host/path only; never persist query/fragment (may hold secrets)."""
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, "", "")
+    )[:200]
+
+
 # --- webfetch ----------------------------------------------------------------
 def webfetch_tool(workspace: pathlib.Path, config) -> Tool:
     default_chars = int(config.limits.webfetch_chars)
 
     def fn(args: dict) -> ToolResult:
         try:
+            _allowed = {"url", "max_chars"}
+            for _k in args:
+                if _k not in _allowed:
+                    return ToolResult(
+                        False,
+                        f"ERROR: webfetch: unexpected argument '{_k}' — allowed: url, max_chars",
+                    )
             url = args.get("url")
             if url is None:
                 return ToolResult(False, "ERROR: missing argument 'url'")
@@ -96,6 +128,8 @@ def webfetch_tool(workspace: pathlib.Path, config) -> Tool:
             raw_chars = args.get("max_chars")
             try:
                 max_chars = int(raw_chars) if raw_chars else default_chars
+                if raw_chars:
+                    max_chars = min(max(max_chars, _MIN_FETCH_CHARS), _MAX_FETCH_CHARS)
             except (TypeError, ValueError):
                 return ToolResult(False, "ERROR: max_chars must be an integer")
 
@@ -106,13 +140,18 @@ def webfetch_tool(workspace: pathlib.Path, config) -> Tool:
             for hop in range(_MAX_REDIRECT_HOPS + 1):
                 reason = _hop_blocked_reason(current)
                 if reason is not None:
-                    return ToolResult(False, f"ERROR: blocked: {reason}: {current}")
+                    return ToolResult(
+                        False, f"ERROR: blocked: {reason}: {_safe_url(current)}"
+                    )
                 with httpx.stream(
                     "GET",
                     current,
                     follow_redirects=False,
                     timeout=_FETCH_TIMEOUT_S,
-                    headers={"User-Agent": _USER_AGENT},
+                    headers={
+                        "User-Agent": _USER_AGENT,
+                        "Cache-Control": "no-cache",
+                    },
                 ) as resp:
                     if resp.status_code in (301, 302, 303, 307, 308):
                         location = resp.headers.get("location")
@@ -164,14 +203,17 @@ def webfetch_tool(workspace: pathlib.Path, config) -> Tool:
                 text = re.sub(r"\n{3,}", "\n\n", text).strip()
             if len(text) > max_chars:
                 text = text[:max_chars] + "\n...[truncated]"
-            return ToolResult(True, text)
+            return ToolResult(True, f"{_date_context_header()}\n\n{text}")
         except Exception as exc:  # noqa: BLE001 - tool boundary must never raise
             return ToolResult(False, f"ERROR: webfetch failed: {exc}")
 
     return Tool(
         name="webfetch",
-        description="Fetch an http(s) URL and return its text "
-        "(HTML is stripped to plain text).",
+        description=(
+            "Fetch an http(s) URL and return its text (HTML stripped). "
+            "The model MUST call get_current_time BEFORE calling this tool to verify the current "
+            "date, month, and year. Output includes a current datetime context header."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -194,38 +236,80 @@ def webfetch_tool(workspace: pathlib.Path, config) -> Tool:
 def websearch_tool(workspace: pathlib.Path, config) -> Tool:
     def fn(args: dict) -> ToolResult:
         try:
+            _allowed = {"query", "max_results", "recency"}
+            for _k in args:
+                if _k not in _allowed:
+                    return ToolResult(
+                        False,
+                        f"ERROR: websearch: unexpected argument '{_k}' — allowed: query, max_results, recency (day|week|month|year). Use 'query' for search text, not 'url'.",
+                    )
             query = args.get("query")
             if query is None:
                 return ToolResult(False, "ERROR: missing argument 'query'")
             raw_n = args.get("max_results")
-            max_results = int(raw_n) if raw_n else 5
+            max_results = min(max(int(raw_n) if raw_n else 5, 1), 10)
+            recency = args.get("recency")
+            timelimit = None
+            if recency:
+                timelimit = _RECENCY_TO_TIMELIMIT.get(str(recency).lower().strip())
+                if timelimit is None:
+                    return ToolResult(
+                        False,
+                        "ERROR: recency must be one of day|week|month|year",
+                    )
             if DDGS is None:
-                raise RuntimeError("ddgs package unavailable")
-            results = DDGS().text(str(query), max_results=max_results)
+                return ToolResult(
+                    False,
+                    "ERROR: websearch failed: duckduckgo search package is not installed (ddgs/duckduckgo_search unavailable)",
+                )
+            try:  # ddgs >=9 moved timeout onto the constructor
+                ddgs = DDGS(timeout=_SEARCH_TIMEOUT_S)
+            except TypeError:  # pragma: no cover - older signatures / stubs
+                ddgs = DDGS()
+            kwargs = {"max_results": max_results}
+            if timelimit is not None:
+                kwargs["timelimit"] = timelimit
+            try:
+                results = list(ddgs.text(str(query), **kwargs))
+            except Exception as exc:
+                return ToolResult(False, f"ERROR: websearch failed: {type(exc).__name__}: {exc}")
 
             blocks = []
             for i, item in enumerate(results, start=1):
-                title = str(item.get("title", "") or "")
-                url = str(item.get("url") or item.get("href") or "")
-                snippet = str(item.get("snippet") or item.get("body") or "")
-                blocks.append(f"[{i}] {title}\n    {url}\n    {snippet}")
+                if isinstance(item, dict):
+                    title = str(item.get("title") or "").strip()
+                    url = str(item.get("url") or item.get("href") or "").strip()
+                    snippet = str(item.get("snippet") or item.get("body") or "").strip()
+                    blocks.append(f"[{i}] {title}\n    {url}\n    {snippet}")
+                elif isinstance(item, str):
+                    blocks.append(f"[{i}] {item}")
             output = "\n\n".join(blocks)
-            return ToolResult(True, output if output else "(no results)")
-        except Exception:  # noqa: BLE001 - network failures must degrade softly
-            return ToolResult(
-                False, "ERROR: websearch failed (offline or rate-limited)"
-            )
+            result = output if output else "(no results)"
+            return ToolResult(True, f"{_date_context_header()}\n\n{result}")
+        except Exception as exc:  # noqa: BLE001 - network failures must degrade softly
+            detail = f"{type(exc).__name__}: {exc}"[:200]
+            return ToolResult(False, f"ERROR: websearch failed: {detail}")
 
     return Tool(
         name="websearch",
-        description="Search the web (DuckDuckGo) and return titled result snippets.",
+        description=(
+            "Search the web (DuckDuckGo) and return titled result snippets. "
+            "Optional recency=day|week|month|year limits freshness. "
+            "The model MUST call get_current_time BEFORE calling this tool so search queries "
+            "target information freshest relative to today's date. Output includes a current datetime context header."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query string."},
                 "max_results": {
                     "type": "integer",
-                    "description": "Number of results (default 5).",
+                    "description": "Number of results (default 5, clamped 1-10).",
+                },
+                "recency": {
+                    "type": "string",
+                    "description": "Freshness window: day|week|month|year "
+                    "(omit for any time).",
                 },
             },
             "required": ["query"],

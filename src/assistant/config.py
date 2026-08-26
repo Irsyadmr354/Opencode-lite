@@ -1,15 +1,32 @@
-"""Configuration dataclasses and TOML/env/overrides loading for assistant.
-
-Config is pure data: [permissions] values are normalized and validated here
-(allow|ask|deny), but enforcement of those decisions lives in the UI layer.
-"""
-
+"""JSON config loader for assistant."""
 from __future__ import annotations
 
+import json
 import os
 import pathlib
-import tomllib
-from dataclasses import dataclass, field, fields
+import shutil
+import sys
+from dataclasses import dataclass, field
+from typing import Any
+
+_DEFAULT_PATH = pathlib.Path.home() / ".assistant" / "config.json"
+_VALID_PERMS = {"allow", "ask", "deny"}
+
+
+def get_default_shell_cmd() -> list[str]:
+    """Return the default platform-aware shell command."""
+    if sys.platform == "win32" or os.name == "nt":
+        if shutil.which("powershell"):
+            return ["powershell", "-NoProfile", "-Command"]
+        if shutil.which("cmd.exe") or shutil.which("cmd"):
+            return ["cmd.exe", "/c"]
+        return ["powershell", "-NoProfile", "-Command"]
+    else:
+        if shutil.which("bash"):
+            return ["bash", "-c"]
+        if shutil.which("sh"):
+            return ["sh", "-c"]
+        return ["bash", "-c"]
 
 
 @dataclass
@@ -32,173 +49,117 @@ class Permissions:
 
 @dataclass
 class Config:
-    model: str = "qwen3.5-4b-uncensored"
+    model: str = "qwen2.5-coder-3b-abliterated"
     base_url: str = "http://127.0.0.1:11434/v1"
     api_key: str = "ollama"
     workspace: pathlib.Path = field(default_factory=pathlib.Path.cwd)
-    max_tool_rounds: int = 25
+    max_rounds: int = 12
     stream: bool = True
-    verbose: bool = False
+    verbose: bool = True
     timeout_s: int = 600
-    max_context_tokens: int = 12000
-    system_prompt: str | None = None  # universal: null -> generic fallback, set in config.toml
-    identity: str | None = None  # separate identity: set in config.toml [identity] or identity
+    shell_cmd: list[str] = field(default_factory=get_default_shell_cmd)
     limits: Limits = field(default_factory=Limits)
     permissions: Permissions = field(default_factory=Permissions)
-    shell_cmd: list[str] = field(
-        default_factory=lambda: ["powershell", "-NoProfile", "-Command"]
-        if os.name == "nt"
-        else ["/bin/sh", "-c"]
-    )
 
 
-_TOP_LEVEL_KEYS = {
-    "model",
-    "base_url",
-    "api_key",
-    "workspace",
-    "max_tool_rounds",
-    "stream",
-    "verbose",
-    "timeout_s",
-    "max_context_tokens",
-    "shell_cmd",
-    "system_prompt",
-    "prompt",  # table [prompt] with system key
-    "identity",  # identity string or [identity] table
-}
+def _apply_env(cfg: Config) -> None:
+    """Override config fields from environment variables."""
+    env_map: dict[str, tuple[str, type]] = {
+        "ASSISTANT_MODEL": ("model", str),
+        "ASSISTANT_BASE_URL": ("base_url", str),
+        "ASSISTANT_API_KEY": ("api_key", str),
+        "ASSISTANT_MAX_ROUNDS": ("max_rounds", int),
+        "ASSISTANT_TIMEOUT_S": ("timeout_s", int),
+        "ASSISTANT_WORKSPACE": ("workspace", pathlib.Path),
+        "ASSISTANT_STREAM": ("stream", bool),
+        "ASSISTANT_VERBOSE": ("verbose", bool),
+    }
+    for env_key, (attr, typ) in env_map.items():
+        val = os.environ.get(env_key)
+        if val is not None and val.strip() != "":
+            if typ == int:
+                try:
+                    setattr(cfg, attr, int(val))
+                except ValueError:
+                    raise ValueError(f"{attr} from {env_key} must be an integer, got {val!r}")
+            elif typ == bool:
+                setattr(cfg, attr, val.lower() in ("1", "true", "yes", "on"))
+            elif typ == pathlib.Path:
+                setattr(cfg, attr, pathlib.Path(val))
+            else:
+                setattr(cfg, attr, str(val))
+
+    raw_shell = os.environ.get("ASSISTANT_SHELL_CMD")
+    if raw_shell is not None and raw_shell.strip() != "":
+        try:
+            parsed = json.loads(raw_shell)
+            if isinstance(parsed, list):
+                cfg.shell_cmd = [str(x) for x in parsed]
+            else:
+                cfg.shell_cmd = [str(parsed)]
+        except json.JSONDecodeError:
+            cfg.shell_cmd = [raw_shell.strip()]
 
 
-_VALID_PERMISSION_VALUES = frozenset({"allow", "ask", "deny"})
+def _validate_int_fields(cfg: Config) -> None:
+    """Ensure positive integers."""
+    for name in ("max_rounds", "timeout_s"):
+        val = getattr(cfg, name)
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {val!r}")
+    for name in (
+        "read_max_lines",
+        "shell_timeout_s",
+        "shell_output_chars",
+        "webfetch_chars",
+        "list_max_entries",
+    ):
+        val = getattr(cfg.limits, name)
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            raise ValueError(f"limits.{name} must be a positive integer, got {val!r}")
 
 
-def _normalized_permission(key: str, value: object) -> str:
-    """Normalize a [permissions] value; reject anything outside allow|ask|deny.
-
-    A typo like ``shell = "Ask"`` must fail loudly instead of silently
-    disabling the safety prompt (consumers treat unknown values as allow).
-    """
-    normalized = str(value).strip().lower()
-    if normalized not in _VALID_PERMISSION_VALUES:
-        raise ValueError(
-            f"invalid permissions.{key} value {value!r}: "
-            'expected "allow" | "ask" | "deny"'
-        )
-    return normalized
+def _validate_permissions(perms: Permissions) -> None:
+    """Ensure permission values are valid."""
+    for name in ("write", "delete", "shell", "webfetch", "websearch"):
+        val = getattr(perms, name, None)
+        if val not in _VALID_PERMS:
+            raise ValueError(
+                f"permissions.{name} must be one of {_VALID_PERMS}, got {val!r}"
+            )
 
 
-def _check_section(section: dict, cls: type, label: str) -> None:
-    known = {f.name for f in fields(cls)}
-    unknown = sorted(set(section) - known)
-    if unknown:
-        raise ValueError(f"unknown {label} key(s): {', '.join(unknown)}")
+def _deep_update(data: dict, target: Any, prefix: str = "") -> None:
+    """Recursively update dataclass fields from a dict."""
+    for key, val in data.items():
+        if not hasattr(target, key):
+            continue
+        cur = getattr(target, key)
+        if hasattr(cur, "__dataclass_fields__") and isinstance(val, dict):
+            _deep_update(val, cur, f"{prefix}{key}.")
+        elif key == "workspace" and isinstance(val, str):
+            setattr(target, key, pathlib.Path(val))
+        elif key == "shell_cmd" and isinstance(val, str):
+            setattr(target, key, [val])
+        else:
+            setattr(target, key, val)
 
 
-def _split_mapping(raw: dict | None) -> tuple[dict, dict, dict]:
-    """Split a mapping into (top-level, limits, permissions), validating keys."""
-    data = dict(raw or {})
-    limits = data.pop("limits", {}) or {}
-    permissions = data.pop("permissions", {}) or {}
-    prompt_tbl = data.pop("prompt", None)
-    identity_tbl = data.pop("identity", None)
-    if not isinstance(limits, dict) or not isinstance(permissions, dict):
-        raise ValueError("[limits] and [permissions] must be tables")
-    # normalize [prompt] table -> system_prompt
-    if prompt_tbl is not None:
-        if not isinstance(prompt_tbl, dict):
-            raise ValueError("[prompt] must be a table")
-        if "system" in prompt_tbl and "system_prompt" not in data:
-            data["system_prompt"] = prompt_tbl["system"]
-        # also allow prompt.system_prompt
-        if "system_prompt" in prompt_tbl and "system_prompt" not in data:
-            data["system_prompt"] = prompt_tbl["system_prompt"]
-        # ignore other prompt keys for now
-    # normalize [identity] table or string -> identity
-    if identity_tbl is not None:
-        if isinstance(identity_tbl, dict):
-            if "system" in identity_tbl and "identity" not in data:
-                data["identity"] = str(identity_tbl["system"])
-            elif "description" in identity_tbl and "identity" not in data:
-                data["identity"] = str(identity_tbl["description"])
-            elif "identity" not in data:
-                parts = [str(v) for k, v in identity_tbl.items() if v]
-                if parts:
-                    data["identity"] = ", ".join(parts)
-        elif isinstance(identity_tbl, str):
-            if "identity" not in data:
-                data["identity"] = identity_tbl
-    unknown_top = sorted(set(data) - _TOP_LEVEL_KEYS)
-    if unknown_top:
-        raise ValueError(f"unknown config key(s): {', '.join(unknown_top)}")
-    _check_section(limits, Limits, "limits")
-    _check_section(permissions, Permissions, "permissions")
-    return data, limits, permissions
-
-
-def _apply(cfg: Config, top: dict, limits: dict, permissions: dict) -> None:
-    workspace = top.pop("workspace", None)
-    if "verbose" in top:
-        v = top["verbose"]
-        if not isinstance(v, bool):
-            raise ValueError(f"invalid verbose value {v!r}: expected bool")
-    if "timeout_s" in top:
-        tv = top["timeout_s"]
-        if not isinstance(tv, int) or tv <= 0:
-            raise ValueError(f"invalid timeout_s value {tv!r}: expected positive int")
-    if "max_context_tokens" in top:
-        mct = top["max_context_tokens"]
-        if not isinstance(mct, int) or mct <= 0:
-            raise ValueError(f"invalid max_context_tokens value {mct!r}: expected positive int")
-    if "system_prompt" in top:
-        sp = top["system_prompt"]
-        if sp is not None and not isinstance(sp, str):
-            raise ValueError(f"invalid system_prompt value {sp!r}: expected string or null")
-    if "identity" in top:
-        ident = top["identity"]
-        if ident is not None and not isinstance(ident, str):
-            raise ValueError(f"invalid identity value {ident!r}: expected string or null")
-    for key, value in top.items():
-        setattr(cfg, key, value)
-    for key, value in limits.items():
-        setattr(cfg.limits, key, value)
-    for key, value in permissions.items():
-        setattr(cfg.permissions, key, _normalized_permission(key, value))
-    if workspace is not None:
-        cfg.workspace = pathlib.Path(str(workspace)).expanduser().resolve()
-
-
-def load_config(path: pathlib.Path | None = None, overrides: dict | None = None) -> Config:
-    """Build a Config: defaults <- TOML file <- env vars <- overrides dict."""
+def load_config(path: pathlib.Path | None = None) -> Config:
+    """Load config from JSON file, with env overrides. Returns defaults if missing."""
     cfg = Config()
-    if path is not None:
-        with open(path, "rb") as fh:
-            data = tomllib.load(fh)
-        top, limits, permissions = _split_mapping(data)
-        _apply(cfg, top, limits, permissions)
+    path = path or _DEFAULT_PATH
 
-    env_model = os.environ.get("OCLITE_MODEL")
-    if env_model:
-        cfg.model = env_model
-    env_base_url = os.environ.get("OCLITE_BASE_URL")
-    if env_base_url:
-        cfg.base_url = env_base_url
-    env_verbose = os.environ.get("OCLITE_VERBOSE")
-    if env_verbose is not None:
-        cfg.verbose = env_verbose.strip().lower() in ("1", "true", "yes")
-    env_timeout = os.environ.get("OCLITE_TIMEOUT_S")
-    if env_timeout is not None:
+    if path.is_file():
         try:
-            cfg.timeout_s = int(env_timeout)
-        except ValueError:
-            raise ValueError(f"invalid OCLITE_TIMEOUT_S value {env_timeout!r}: expected int")
-    env_mct = os.environ.get("OCLITE_MAX_CONTEXT_TOKENS")
-    if env_mct is not None:
-        try:
-            cfg.max_context_tokens = int(env_mct)
-        except ValueError:
-            raise ValueError(f"invalid OCLITE_MAX_CONTEXT_TOKENS value {env_mct!r}: expected int")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                _deep_update(data, cfg)
+        except (json.JSONDecodeError, OSError):
+            pass
 
-    if overrides:
-        top, limits, permissions = _split_mapping(overrides)
-        _apply(cfg, top, limits, permissions)
+    _apply_env(cfg)
+    _validate_int_fields(cfg)
+    _validate_permissions(cfg.permissions)
+
     return cfg

@@ -1,99 +1,42 @@
-"""Session persistence for assistant conversations.
+"""JSON session save/load."""
+from __future__ import annotations
 
-Provides helpers to save, load, list and delete chat sessions stored as
-JSON files under ``~/.assistant/sessions``. Session names are restricted
-to alphanumeric characters plus ``_``, ``-`` and ``.`` to prevent path
-traversal and ensure portable filenames.
-"""
-
-import datetime
 import json
-import re
-from pathlib import Path
-
-SESSION_DIR = Path.home() / ".assistant" / "sessions"
-
-_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+import os
+import tempfile
+import pathlib
 
 
-def _session_dir() -> Path:
-    """Return the sessions directory, creating it if needed."""
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    return SESSION_DIR
+class Session:
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = path
+        self.messages: list[dict] = []
 
+    def append(self, role: str, content: str) -> None:
+        self.messages.append({"role": role, "content": content})
 
-def session_path(name: str) -> Path:
-    """Return the file path for a session name.
+    def clear(self) -> None:
+        self.messages.clear()
 
-    Validates ``name`` against ``^[A-Za-z0-9._-]+$`` and raises
-    ``ValueError`` if invalid.
-    """
-    if not isinstance(name, str) or not _NAME_RE.match(name):
-        raise ValueError(f"invalid session name: {name!r} (allowed: alphanumeric + _ - .)")
-    return _session_dir() / f"{name}.json"
+    def save(self) -> None:
+        """Atomic write: temp file then rename."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.messages, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
 
-
-def list_sessions() -> list[str]:
-    """List session names (``*.json`` stems) sorted alphabetically."""
-    d = _session_dir()
-    return sorted(p.stem for p in d.glob("*.json"))
-
-
-def save_session(name: str, messages: list[dict]) -> Path:
-    """Save ``messages`` to a session file.
-
-    Validates ``name`` via ``^[A-Za-z0-9._-]+$`` and that ``messages`` is a
-    list. Writes JSON with ``indent=2`` containing ``{"messages": ..., "saved_at": ...}``
-    where ``saved_at`` is an ISO-8601 UTC timestamp. Raises ``ValueError``
-    if validation fails. Returns the path written.
-    """
-    if not isinstance(name, str) or not _NAME_RE.match(name):
-        raise ValueError(f"invalid session name: {name!r} (allowed: alphanumeric + _ - .)")
-    if not isinstance(messages, list):
-        raise ValueError("messages must be a list")
-    path = session_path(name)
-    data = {
-        "messages": messages,
-        "saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    return path
-
-
-def load_session(name: str) -> list[dict]:
-    """Load and return ``messages`` for ``name``.
-
-    Raises ``FileNotFoundError`` if the session file does not exist and
-    ``ValueError`` if the JSON structure is invalid (not a dict with a
-    ``messages`` list).
-
-    Validation of ``name`` uses the same ``^[A-Za-z0-9._-]+$`` rule as
-    :func:`session_path`.
-    """
-    path = session_path(name)
-    if not path.is_file():
-        raise FileNotFoundError(f"session not found: {name!r}")
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"invalid session file: {name!r} contains invalid JSON") from e
-    if not isinstance(data, dict) or "messages" not in data or not isinstance(data["messages"], list):
-        raise ValueError(f"invalid session file: {name!r} must contain a dict with a 'messages' list")
-    # Ensure messages is a list of dicts when non-empty
-    if not all(isinstance(m, dict) for m in data["messages"]):
-        raise ValueError(f"invalid session file: {name!r} messages must be a list of dicts")
-    return data["messages"]
-
-
-def delete_session(name: str) -> None:
-    """Delete the session file for ``name``.
-
-    Validates ``name`` via ``^[A-Za-z0-9._-]+$``. Raises
-    ``FileNotFoundError`` if the file does not exist.
-    """
-    path = session_path(name)
-    if not path.is_file():
-        raise FileNotFoundError(f"session not found: {name!r}")
-    path.unlink()
+    @classmethod
+    def load(cls, path: pathlib.Path) -> Session:
+        """Load session from file, empty if missing."""
+        s = cls(path)
+        if path.is_file():
+            try:
+                s.messages = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+        return s

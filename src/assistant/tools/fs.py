@@ -1,7 +1,9 @@
 """Filesystem tools: read_file, write_file, delete_file, list_files.
 
 Every path argument is resolved against ``workspace.resolve()``; anything that
-escapes the workspace root is rejected with ``ERROR: path outside workspace``.
+escapes the workspace root is rejected with
+``ERROR: path outside workspace (workspace: <root>) — use a path relative to
+workspace or restart with --workspace <path>``.
 All tool bodies are wrapped in try/except — a Tool.fn never raises.
 """
 from __future__ import annotations
@@ -25,15 +27,29 @@ _MISSING = "ERROR: missing argument '{}'"
 _OUTSIDE = "ERROR: path outside workspace"
 
 
+def _outside_error(ws: pathlib.Path) -> str:
+    """Helpful outside-workspace message that keeps the required substring."""
+    return (
+        f"ERROR: path outside workspace (workspace: {ws})"
+        " — use a path relative to workspace or restart with --workspace <desired-path>"
+    )
+
+
 def _resolve_in_workspace(
     workspace: pathlib.Path, raw: str
-) -> tuple[pathlib.Path | None, pathlib.Path | None]:
-    """Resolve *raw* against the workspace; return (ws, target) or (None, None)."""
+) -> tuple[pathlib.Path, pathlib.Path | None]:
+    """Resolve *raw* against the workspace; return (ws, target) or (ws, None) if outside."""
     ws = workspace.resolve()
-    candidate = (ws / str(raw)).resolve()
-    if not candidate.is_relative_to(ws):
-        return None, None
-    return ws, candidate
+    clean = str(raw).strip().strip("'\"")
+    if not clean or clean == ".":
+        return ws, ws
+    try:
+        candidate = (ws / clean).resolve()
+        if not candidate.is_relative_to(ws):
+            return ws, None
+        return ws, candidate
+    except Exception:
+        return ws, None
 
 
 def _is_excluded(parts: Iterable[str]) -> bool:
@@ -50,6 +66,9 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
     matches zero directories), mirroring pathlib glob semantics closely enough
     for the patterns this tool accepts.
     """
+    pattern = str(pattern).strip().replace("\\", "/")
+    if pattern.startswith("./"):
+        pattern = pattern[2:]
     out: list[str] = []
     i, n = 0, len(pattern)
     while i < n:
@@ -100,20 +119,36 @@ def _iter_entries(base: pathlib.Path, cap: int) -> Generator[pathlib.Path]:
 
 # --- read_file ---------------------------------------------------------------
 def read_file_tool(workspace: pathlib.Path, config) -> Tool:
-    max_lines = int(config.limits.read_max_lines)
+    max_lines = int(getattr(getattr(config, "limits", None), "read_max_lines", 200))
 
     def fn(args: dict) -> ToolResult:
         try:
             raw = args.get("path")
             if raw is None:
                 return ToolResult(False, _MISSING.format("path"))
-            ws, target = _resolve_in_workspace(workspace, raw)
+            raw_str = str(raw).strip().strip("'\"")
+            if not raw_str:
+                return ToolResult(False, _MISSING.format("path"))
+            ws, target = _resolve_in_workspace(workspace, raw_str)
             if target is None:
-                return ToolResult(False, _OUTSIDE)
+                return ToolResult(False, _outside_error(ws))
+            if not target.exists():
+                return ToolResult(
+                    False,
+                    f"ERROR: not found: {raw_str} (workspace: {ws})",
+                )
             if target.is_dir():
-                return ToolResult(False, f"ERROR: '{raw}' is a directory. Call list_files with path '{raw}' to see contents.")
+                return ToolResult(
+                    False,
+                    f"ERROR: '{raw_str}' is a directory (workspace: {ws}). "
+                    f"Call list_files with path '{raw_str}' to see contents.",
+                )
             if not target.is_file():
-                return ToolResult(False, f"ERROR: not a file: {raw}")
+                return ToolResult(
+                    False,
+                    f"ERROR: not a file: {raw_str} (workspace: {ws})"
+                    " — path must be relative to workspace",
+                )
             size = target.stat().st_size
             if size > _MAX_READ_BYTES:
                 return ToolResult(
@@ -131,12 +166,12 @@ def read_file_tool(workspace: pathlib.Path, config) -> Tool:
             lines = text.splitlines()
             if not lines:
                 return ToolResult(True, "(empty file)")
-            selected = lines[start_line - 1 : start_line - 1 + max_lines]
-            if not selected:
+            if start_line > len(lines):
                 return ToolResult(
                     False,
                     f"ERROR: start_line {start_line} beyond end of file ({len(lines)} lines)",
                 )
+            selected = lines[start_line - 1 : start_line - 1 + max_lines]
             end = start_line + len(selected) - 1
             body = "\n".join(
                 f"{n:5d}: {lines[n - 1]}" for n in range(start_line, end + 1)
@@ -176,12 +211,20 @@ def write_file_tool(workspace: pathlib.Path, config) -> Tool:
             raw = args.get("path")
             if raw is None:
                 return ToolResult(False, _MISSING.format("path"))
+            raw_str = str(raw).strip().strip("'\"")
+            if not raw_str:
+                return ToolResult(False, _MISSING.format("path"))
             content = args.get("content")
             if content is None:
                 return ToolResult(False, _MISSING.format("content"))
-            ws, target = _resolve_in_workspace(workspace, raw)
+            ws, target = _resolve_in_workspace(workspace, raw_str)
             if target is None:
-                return ToolResult(False, _OUTSIDE)
+                return ToolResult(False, _outside_error(ws))
+            if target.is_dir():
+                return ToolResult(
+                    False,
+                    f"ERROR: cannot write: '{raw_str}' is an existing directory (workspace: {ws})",
+                )
             data = str(content).encode("utf-8")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)  # exact utf-8 bytes, no newline translation
@@ -220,15 +263,21 @@ def delete_file_tool(workspace: pathlib.Path, config) -> Tool:
             raw = args.get("path")
             if raw is None:
                 return ToolResult(False, _MISSING.format("path"))
-            ws, target = _resolve_in_workspace(workspace, raw)
+            raw_str = str(raw).strip().strip("'\"")
+            if not raw_str:
+                return ToolResult(False, _MISSING.format("path"))
+            ws, target = _resolve_in_workspace(workspace, raw_str)
             if target is None:
-                return ToolResult(False, _OUTSIDE)
+                return ToolResult(False, _outside_error(ws))
             if not target.exists():
-                return ToolResult(False, f"ERROR: not found: {raw}")
+                return ToolResult(
+                    False,
+                    f"ERROR: not found: {raw_str} (workspace: {ws})",
+                )
             if target.is_dir():
                 return ToolResult(
                     False,
-                    f"ERROR: '{raw}' is a directory",
+                    f"ERROR: '{raw_str}' is a directory (workspace: {ws})",
                 )
             os.remove(target)
             rel = target.relative_to(ws).as_posix()
@@ -257,17 +306,31 @@ def delete_file_tool(workspace: pathlib.Path, config) -> Tool:
 
 # --- list_files --------------------------------------------------------------
 def list_files_tool(workspace: pathlib.Path, config) -> Tool:
-    max_entries = int(config.limits.list_max_entries)
+    max_entries = int(getattr(getattr(config, "limits", None), "list_max_entries", 200))
 
     def fn(args: dict) -> ToolResult:
         try:
-            raw = args.get("path") or "."
-            pattern = str(args.get("pattern") or "**/*")
-            ws, base = _resolve_in_workspace(workspace, raw)
+            raw = args.get("path")
+            raw_str = str(raw).strip().strip("'\"") if raw is not None else "."
+            if not raw_str:
+                raw_str = "."
+            pattern = str(args.get("pattern") or "**/*").strip()
+            if not pattern:
+                pattern = "**/*"
+            ws, base = _resolve_in_workspace(workspace, raw_str)
             if base is None:
-                return ToolResult(False, _OUTSIDE)
+                return ToolResult(False, _outside_error(ws))
+            if not base.exists():
+                return ToolResult(
+                    False,
+                    f"ERROR: not found: {raw_str} (workspace: {ws})",
+                )
             if not base.is_dir():
-                return ToolResult(False, f"ERROR: not a directory: {raw}")
+                return ToolResult(
+                    False,
+                    f"ERROR: not a directory: {raw_str} (workspace: {ws})"
+                    " — path must be relative to workspace",
+                )
 
             regex = _glob_to_regex(pattern)
 

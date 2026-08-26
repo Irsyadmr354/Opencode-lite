@@ -8,6 +8,9 @@ Contract (consumed by core/ and ui/):
 
 ``config`` is duck-typed: ``config.limits.<field>`` and ``config.shell_cmd``.
 This package deliberately never imports ``assistant.config``.
+Filesystem (fs) tools are sandboxed to the workspace root — paths outside are
+rejected with a hint to use a workspace-relative path or restart with
+``--workspace <path>``.
 
 NOTE: the dataclasses below are intentionally declared *before* the submodule
 imports; fs/shell/web bind ``Tool``/``ToolResult`` from the partially
@@ -49,12 +52,14 @@ def get_tools(workspace: pathlib.Path, config) -> list[Tool]:
     """Return every built-in tool bound to ``workspace``/``config``.
 
     Safe tools come first, dangerous ones last (UI groups/paints by ``danger``).
-    Time tool kept near web for 'date before search' flow but not first to avoid bias on greetings.
+    Time listed before web so date-aware tools appear earlier in the schema;
+    the agent additionally injects live date context into system prompt and web
+    tool outputs.
     """
     return (
         _build_fs_tools(workspace, config)
-        + _build_web_tools(workspace, config)
         + _build_time_tools(workspace, config)
+        + _build_web_tools(workspace, config)
         + _build_shell_tools(workspace, config)
     )
 

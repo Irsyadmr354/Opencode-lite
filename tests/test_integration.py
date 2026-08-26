@@ -1,479 +1,296 @@
-"""Integration tests: real tools + agent loop + permission enforcement."""
-
-from __future__ import annotations
-
-import asyncio
-import sys
-from pathlib import Path
-from types import SimpleNamespace
-
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-for _p in (str(_ROOT / "src"), str(_HERE)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from fake_ollama import FakeOllama  # noqa: E402
-
-import assistant.ui as ui_mod  # noqa: E402
-from assistant.agent import Agent, Hooks  # noqa: E402
-from assistant.config import load_config  # noqa: E402
-from assistant.llm import LLMClient  # noqa: E402
-from assistant.tools import get_tools  # noqa: E402
-
-
-class TrackingHooks(Hooks):
-    def __init__(self, allow: bool = True):
-        super().__init__()
-        self.allow = allow
-        self.asked: list[tuple[str, dict]] = []
-        self.tool_results: list[tuple[str, object]] = []
-
-    def on_permission(self, name: str, args: dict) -> bool:
-        self.asked.append((name, dict(args)))
-        return self.allow
-
-    def on_tool_result(self, name: str, res) -> None:
-        self.tool_results.append((name, res))
-
-
-def _run(script: list[dict], tmp_path: Path, hooks: Hooks,
-         permissions: dict | None = None) -> Agent:
-    server = FakeOllama(script)
-    server.start()
-    try:
-        cfg = load_config(None, {"workspace": tmp_path})
-        if permissions:
-            for key, value in permissions.items():
-                setattr(cfg.permissions, key, value)
-        client = LLMClient(server.base_url, "ollama", "fake")
-        agent = Agent(client, get_tools(cfg.workspace, cfg), cfg, hooks)
-        agent.submit("do it")
-        return agent
-    finally:
-        server.shutdown()
-
-
-def test_policy_deny_blocks_write_without_asking(tmp_path):
-    """permissions.write='deny' -> write_file refused, never prompts the user."""
-    hooks = TrackingHooks()
-    script = [
-        {"content": None, "tool_calls": [{
-            "id": "c1", "type": "function",
-            "function": {"name": "write_file",
-                         "arguments": '{"path": "note.txt", "content": "hi"}'}}]},
-        {"content": "done"},
-    ]
-    agent = _run(script, tmp_path, hooks, permissions={"write": "deny"})
-
-    assert not (tmp_path / "note.txt").exists(), "file must NOT be written"
-    assert hooks.asked == [], "deny must short-circuit without prompting"
-    tool_msgs = [m["content"] for m in agent.messages if m.get("role") == "tool"]
-    assert any("DENIED by policy" in c for c in tool_msgs)
-    assert agent.messages[-1]["content"] == "done"
-
-
-def test_policy_ask_prompts_for_non_dangerous_write(tmp_path):
-    """permissions.write='ask' -> even safe tools prompt; allow => executed."""
-    hooks = TrackingHooks(allow=True)
-    script = [
-        {"content": None, "tool_calls": [{
-            "id": "c1", "type": "function",
-            "function": {"name": "write_file",
-                         "arguments": '{"path": "ok.txt", "content": "x"}'}}]},
-        {"content": "wrote"},
-    ]
-    _run(script, tmp_path, hooks, permissions={"write": "ask"})
-
-    assert ("write_file", {"path": "ok.txt", "content": "x"}) in hooks.asked
-    assert (tmp_path / "ok.txt").read_text(encoding="utf-8") == "x"
-
-
-def test_shell_denied_by_user_never_executes(tmp_path):
-    """danger tool + user says no -> DENIED by user, command not run."""
-    hooks = TrackingHooks(allow=False)
-    script = [
-        {"content": None, "tool_calls": [{
-            "id": "c1", "type": "function",
-            "function": {"name": "shell",
-                         "arguments": '{"command": "Write-Output ran"}'}}]},
-        {"content": "ok"},
-    ]
-    agent = _run(script, tmp_path, hooks)
-
-    assert ("shell", {"command": "Write-Output ran"}) in hooks.asked
-    tool_msgs = [m["content"] for m in agent.messages if m.get("role") == "tool"]
-    assert any(c == "DENIED by user" for c in tool_msgs)
-    assert not any("ran" in c and "DENIED" not in c for c in tool_msgs)
-
-
-# --- Terminal REPL & TerminalHooks integration tests -----------------------
+"""End-to-end and integration tests: config, session, CLI commands, headless mode, Ctrl+C, and typewriter."""
 
 import io
+import json
+import os
+import pathlib
+import sys
+import time
+import unittest.mock as mock
+import pytest
+
+from assistant.__main__ import SESSIONS_DIR, clear_screen, cmd_sessions, main, print_banner, print_help
+from assistant.config import Config, Limits, Permissions, get_default_shell_cmd, load_config
+from assistant.llm import DARK_GRAY, RESET, TypewriterStreamer, typewriter
+from assistant.session import Session
 
 
-class FakeAgent:
-    def __init__(self, ask_permission: bool = False, fail_tool: bool = False):
-        self.hooks = None
-        self.messages: list[dict] = []
-        self.cancelled = False
-        self._ask_permission = ask_permission
-        self._fail_tool = fail_tool
-        self.permission_answer: bool | None = None
-        self.submit_calls: list[str] = []
-
-    def reset(self) -> None:
-        self.messages.clear()
-
-    def submit(self, text: str) -> None:
-        self.submit_calls.append(text)
-        h = self.hooks
-        if not h:
-            return
-        if self._ask_permission:
-            self.permission_answer = bool(h.on_permission(
-                "shell", {"command": "Write-Output hi"}))
-            return
-        h.on_tool_start("shell", {"command": "echo test"})
-        if self._fail_tool:
-            h.on_tool_result("shell", SimpleNamespace(ok=False, output="command failed"))
-        else:
-            h.on_tool_result("shell", SimpleNamespace(ok=True, output="test output"))
-        h.on_delta("hello ")
-        h.on_delta("world")
-        h.on_assistant_done(SimpleNamespace(content="hello world", tool_calls=[]))
-        h.on_status({"round": 1, "max": 25, "approx_tokens": 42})
+# --- 1. Config Loading, Env Overrides & Validations ---
 
 
-def test_terminal_hooks_streaming_word_by_word():
+def test_config_default_platform_shell():
+    cfg = Config()
+    default_shell = get_default_shell_cmd()
+    assert cfg.shell_cmd == default_shell
+    assert isinstance(cfg.shell_cmd, list)
+    assert len(cfg.shell_cmd) >= 1
+    if sys.platform == "win32" or os.name == "nt":
+        assert any(sh in cfg.shell_cmd[0].lower() for sh in ("powershell", "cmd", "bash"))
+    else:
+        assert any(sh in cfg.shell_cmd[0].lower() for sh in ("bash", "sh"))
+
+
+def test_config_env_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("ASSISTANT_MODEL", "custom-env-model")
+    monkeypatch.setenv("ASSISTANT_BASE_URL", "http://custom:1234/v1")
+    monkeypatch.setenv("ASSISTANT_API_KEY", "custom-key")
+    monkeypatch.setenv("ASSISTANT_MAX_ROUNDS", "20")
+    monkeypatch.setenv("ASSISTANT_TIMEOUT_S", "300")
+    monkeypatch.setenv("ASSISTANT_WORKSPACE", str(tmp_path / "env_ws"))
+    monkeypatch.setenv("ASSISTANT_STREAM", "false")
+    monkeypatch.setenv("ASSISTANT_VERBOSE", "true")
+    monkeypatch.setenv("ASSISTANT_SHELL_CMD", '["sh", "-c"]')
+
+    cfg = load_config(tmp_path / "nonexistent.json")
+
+    assert cfg.model == "custom-env-model"
+    assert cfg.base_url == "http://custom:1234/v1"
+    assert cfg.api_key == "custom-key"
+    assert cfg.max_rounds == 20
+    assert cfg.timeout_s == 300
+    assert cfg.workspace == tmp_path / "env_ws"
+    assert cfg.stream is False
+    assert cfg.verbose is True
+    assert cfg.shell_cmd == ["sh", "-c"]
+
+
+def test_config_integer_validation(tmp_path):
+    config_file = tmp_path / "bad_int.json"
+    config_file.write_text(json.dumps({"max_rounds": -1}), encoding="utf-8")
+    with pytest.raises(ValueError, match="max_rounds must be a positive integer"):
+        load_config(config_file)
+
+    config_file.write_text(json.dumps({"limits": {"read_max_lines": 0}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="limits.read_max_lines must be a positive integer"):
+        load_config(config_file)
+
+
+def test_config_permission_validation(tmp_path):
+    config_file = tmp_path / "bad_perm.json"
+    config_file.write_text(json.dumps({"permissions": {"shell": "superuser"}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="permissions.shell must be one of"):
+        load_config(config_file)
+
+
+# --- 2. Session Management Tests ---
+
+
+def test_session_lifecycle(tmp_path):
+    sess_path = tmp_path / "test_session.json"
+    sess = Session(sess_path)
+    assert sess.messages == []
+
+    sess.append("user", "What is the date?")
+    sess.append("assistant", "2026-08-27")
+    sess.save()
+
+    assert sess_path.exists()
+    loaded = Session.load(sess_path)
+    assert len(loaded.messages) == 2
+    assert loaded.messages[0]["role"] == "user"
+    assert loaded.messages[1]["content"] == "2026-08-27"
+
+    sess.clear()
+    assert sess.messages == []
+
+
+# --- 3. Typewriter Speed & Dimmed Reasoning Rendering ---
+
+
+def test_typewriter_speed_clamped_under_tenth_second():
     out = io.StringIO()
-    hooks = ui_mod.TerminalHooks(stdout=out)
-    hooks.on_delta("Hello ")
-    hooks.on_delta("world")
-    hooks.on_delta("!")
-    hooks.on_assistant_done(SimpleNamespace(content="Hello world!"))
-
-    output = out.getvalue()
-    assert "Hello world!\n" in output
+    start = time.perf_counter()
+    typewriter("Test", delay=0.5, stream=out)  # Should clamp delay to < 0.1s
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.3
+    assert out.getvalue() == "Test"
 
 
-def test_terminal_hooks_thinking_tags_ansi_color():
+def test_typewriter_dimmed_reasoning_and_reset():
     out = io.StringIO()
-    hooks = ui_mod.TerminalHooks(stdout=out)
-    hooks.on_delta("<think>pondering deeply</think>Here is the answer.")
-    hooks.on_assistant_done(SimpleNamespace(content="<think>pondering deeply</think>Here is the answer."))
-
-    output = out.getvalue()
-    assert ui_mod.ANSI_THINKING in output
-    assert ui_mod.SPINNER_FRAMES[0] + " Thinking" in output
-    assert "pondering deeply" in output  # reasoning text streams live
-    assert "Here is the answer." in output
+    typewriter("Reasoning...", is_thinking=True, stream=out)
+    val = out.getvalue()
+    assert val.startswith(DARK_GRAY)
+    assert val.endswith(RESET)
 
 
-def test_terminal_hooks_tool_start_and_result():
+def test_typewriter_streamer_chunked_ansi():
     out = io.StringIO()
-    hooks = ui_mod.TerminalHooks(stdout=out)
+    streamer = TypewriterStreamer(delay=0.001, stream=out)
+    streamer.on_delta("Step 1", is_thinking=True)
+    streamer.on_delta("Answer", is_thinking=False)
+    streamer.close()
 
-    # Success tool
-    hooks.on_tool_start("shell", {"command": "git status"})
-    hooks.on_tool_result("shell", SimpleNamespace(ok=True, output="clean"))
-    output = out.getvalue()
-    assert "⚡" in output
-    assert "[shell]" in output
-    assert "git status" in output
-    assert "ok" in output
-
-    # Failed tool
-    out2 = io.StringIO()
-    hooks2 = ui_mod.TerminalHooks(stdout=out2)
-    hooks2.on_tool_start("read_file", {"path": "missing.txt"})
-    hooks2.on_tool_result("read_file", SimpleNamespace(ok=False, output="ERROR: file not found"))
-    output2 = out2.getvalue()
-    assert "⚡" in output2
-    assert "[read_file]" in output2
-    assert "missing.txt" in output2
-    assert "ERROR: file not found" in output2
+    result = out.getvalue()
+    assert DARK_GRAY in result
+    assert "Step 1" in result
+    assert RESET in result
+    assert "Answer" in result
 
 
-def test_terminal_hooks_permission_prompt_inline():
-    prompts: list[str] = []
-
-    def mock_input(p: str) -> str:
-        prompts.append(p)
-        return "y"
-
-    hooks_allow = ui_mod.TerminalHooks(input_fn=mock_input)
-    assert hooks_allow.on_permission("delete_file", {"path": "data.csv"}) is True
-    assert len(prompts) == 1
-    assert "Allow delete_file(data.csv)? [y/N]:" in prompts[0]
-    assert "[permission]" in prompts[0]
-
-    # Deny path
-    hooks_deny = ui_mod.TerminalHooks(input_fn=lambda p: "n")
-    assert hooks_deny.on_permission("delete_file", {"path": "data.csv"}) is False
-
-    # KeyboardInterrupt path
-    def raise_interrupt(p: str) -> str:
-        raise KeyboardInterrupt()
-
-    hooks_interrupt = ui_mod.TerminalHooks(input_fn=raise_interrupt)
-    assert hooks_interrupt.on_permission("delete_file", {"path": "data.csv"}) is False
+# --- 4. Headless CLI Mode Tests ---
 
 
+def test_headless_command_flag(tmp_path):
+    mock_resp = {"content": "42", "tool_calls": []}
 
-def test_terminal_hooks_error_formatting_red():
-    err = io.StringIO()
-    hooks = ui_mod.TerminalHooks(stderr=err)
-    hooks.on_error("Test failure message")
-    output = err.getvalue()
-    assert ui_mod.ANSI_RED in output
-    assert "ERROR:" in output
-    assert "Test failure message" in output
-    assert hooks.had_error is True
+    with mock.patch("assistant.llm.LLM.chat", return_value=mock_resp), \
+         mock.patch("sys.stdout", new=io.StringIO()) as fake_out:
+        main(["-c", "what is 2+2", "--workspace", str(tmp_path)])
+        output = fake_out.getvalue()
+        assert "42" in output
 
 
-def test_repl_banner_and_exit(tmp_path):
-    agent = FakeAgent()
-    cfg = SimpleNamespace(model="qwen-test", workspace=tmp_path, base_url="http://127.0.0.1:11434/v1")
-    outputs: list[str] = []
-    inputs = iter(["/exit"])
+def test_headless_prompt_flag(tmp_path):
+    mock_resp = {"content": "Paris", "tool_calls": []}
 
-    ui_mod.run_repl(
-        agent=agent,
-        config=cfg,
-        input_fn=lambda prompt: next(inputs),
-        output_fn=outputs.append,
-        clear_fn=lambda: None,
-    )
-
-    combined = "\n".join(outputs)
-    assert "assistant" in combined
-    assert "model: qwen-test" in combined
-    assert "/help for commands, /exit to quit" in combined
-    assert "Goodbye!" in combined
+    with mock.patch("assistant.llm.LLM.chat", return_value=mock_resp), \
+         mock.patch("sys.stdout", new=io.StringIO()) as fake_out:
+        main(["-p", "capital of France", "--workspace", str(tmp_path), "--no-stream"])
+        output = fake_out.getvalue()
+        assert "Paris" in output
 
 
-def test_repl_commands_status_model_reset_help(tmp_path):
-    agent = FakeAgent()
-    agent.client = SimpleNamespace(model="qwen-test")
-    agent.messages = [{"role": "user", "content": "hi"}]
-    cfg = SimpleNamespace(
-        model="qwen-test",
-        workspace=tmp_path,
-        base_url="http://127.0.0.1:11434/v1",
-        permissions=SimpleNamespace(write="allow", shell="ask"),
-    )
-    outputs: list[str] = []
-    inputs = iter([
-        "/status",
-        "/model",
-        "/model deepseek-coder:14b",
-        "/clear",
-        "/help",
-        "/quit",
-    ])
-
-    ui_mod.run_repl(
-        agent=agent,
-        config=cfg,
-        input_fn=lambda prompt: next(inputs),
-        output_fn=outputs.append,
-        clear_fn=lambda: None,
-    )
-
-    combined = "\n".join(outputs)
-    # /status check
-    assert "Model:       qwen-test" in combined
-    assert "Base URL:    http://127.0.0.1:11434/v1" in combined
-    assert "write=allow" in combined
-    # /model check
-    assert "Active model: qwen-test" in combined
-    assert "Model switched to: deepseek-coder:14b" in combined
-    assert cfg.model == "deepseek-coder:14b"
-    assert agent.client.model == "deepseek-coder:14b"
-    # /clear resets messages
-    assert agent.messages == []
-    # /help check
-    assert "ASSISTANT GUIDE" in combined
+def test_headless_keyboard_interrupt(tmp_path):
+    with mock.patch("assistant.agent.Agent.handle", side_effect=KeyboardInterrupt), \
+         mock.patch("sys.stderr", new=io.StringIO()) as fake_err:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["-c", "long task", "--workspace", str(tmp_path)])
+        assert exc_info.value.code == 130
+        assert "Cancelled" in fake_err.getvalue()
 
 
-def test_repl_clear_screen(tmp_path):
-    agent = FakeAgent()
-    cfg = SimpleNamespace(model="fake", workspace=tmp_path)
-    cleared = []
-    inputs = iter(["/clear", "/exit"])
-
-    ui_mod.run_repl(
-        agent=agent,
-        config=cfg,
-        input_fn=lambda prompt: next(inputs),
-        output_fn=lambda msg: None,
-        clear_fn=lambda: cleared.append(True),
-    )
-
-    # Launch clear + /clear command = 2 clears
-    assert len(cleared) == 2
+# --- 5. Interactive CLI Commands & Menu Tests ---
 
 
-def test_repl_user_prompt_execution(tmp_path):
-    agent = FakeAgent()
-    cfg = SimpleNamespace(model="fake", workspace=tmp_path)
-    inputs = iter(["build me a feature", "/exit"])
-    outputs: list[str] = []
-
-    ui_mod.run_repl(
-        agent=agent,
-        config=cfg,
-        input_fn=lambda prompt: next(inputs),
-        output_fn=outputs.append,
-        clear_fn=lambda: None,
-    )
-
-    assert agent.submit_calls == ["build me a feature"]
+def test_print_help(capsys):
+    print_help()
+    captured = capsys.readouterr().out
+    assert "/sessions" in captured
+    assert "/clear" in captured
+    assert "/c-context" in captured
+    assert "/help" in captured
+    assert "exit" in captured
 
 
-def test_repl_ctrl_c_cancels_active_generation(tmp_path):
-    class InterruptAgent(FakeAgent):
-        def submit(self, text: str) -> None:
-            self.messages.append({"role": "user", "content": text})
-            raise KeyboardInterrupt()
-
-    agent = InterruptAgent()
-    cfg = SimpleNamespace(model="fake", workspace=tmp_path)
-    outputs: list[str] = []
-    inputs = iter(["long running task", "/exit"])
-
-    ui_mod.run_repl(
-        agent=agent,
-        config=cfg,
-        input_fn=lambda prompt: next(inputs),
-        output_fn=outputs.append,
-        clear_fn=lambda: None,
-    )
-
-    assert agent.cancelled is True
-    combined = "\n".join(outputs)
-    assert "[Cancelled]" in combined
-    # Unfulfilled user message popped
-    assert agent.messages == []
+def test_print_banner(capsys):
+    cfg = Config()
+    print_banner(cfg)
+    captured = capsys.readouterr().out
+    assert "Assistant" in captured
+    assert cfg.model in captured
 
 
-def test_repl_ctrl_c_idle_notice(tmp_path):
-    agent = FakeAgent()
-    cfg = SimpleNamespace(model="fake", workspace=tmp_path)
-    outputs: list[str] = []
-
-    count = 0
-
-    def sim_input(prompt):
-        nonlocal count
-        count += 1
-        if count == 1:
-            raise KeyboardInterrupt()
-        elif count == 2:
-            raise KeyboardInterrupt()
-        return "/exit"
-
-    ui_mod.run_repl(
-        agent=agent,
-        config=cfg,
-        input_fn=sim_input,
-        output_fn=outputs.append,
-        clear_fn=lambda: None,
-    )
-
-    combined = "\n".join(outputs)
-    assert "Type /exit or press Ctrl+C again to quit." in combined
-    assert "Goodbye!" in combined
+def test_clear_screen():
+    with mock.patch("os.system") as mock_sys:
+        clear_screen()
+        assert mock_sys.called
 
 
-def test_repl_eof_clean_exit(tmp_path):
-    agent = FakeAgent()
-    cfg = SimpleNamespace(model="fake", workspace=tmp_path)
-    outputs: list[str] = []
-
-    def sim_input(prompt):
-        raise EOFError()
-
-    ui_mod.run_repl(
-        agent=agent,
-        config=cfg,
-        input_fn=sim_input,
-        output_fn=outputs.append,
-        clear_fn=lambda: None,
-    )
-
-    combined = "\n".join(outputs)
-    assert "Goodbye!" in combined
+def test_interactive_commands_exit(tmp_path):
+    # Simulates entering 'exit' in interactive loop
+    with mock.patch("builtins.input", side_effect=["exit"]), \
+         mock.patch("sys.stdout", new=io.StringIO()):
+        main(["--workspace", str(tmp_path)])
 
 
-def test_prompt_prefix_styled_bold_cyan(tmp_path):
-    agent = FakeAgent()
-    cfg = SimpleNamespace(model="fake", workspace=tmp_path)
-    prompts_received = []
-
-    def sim_input(prompt: str) -> str:
-        prompts_received.append(prompt)
-        return "/exit"
-
-    ui_mod.run_repl(
-        agent=agent,
-        config=cfg,
-        input_fn=sim_input,
-        output_fn=lambda msg: None,
-        clear_fn=lambda: None,
-    )
-
-    assert len(prompts_received) == 1
-    assert prompts_received[0] == "\033[1;36m⬢ You:\033[0m "
-    assert ui_mod.PROMPT_PREFIX == "\033[1;36m⬢ You:\033[0m "
-    assert "⬡ Assistant:" in ui_mod.AI_PREFIX
-    assert "⠋ Thinking:" in ui_mod.THOUGHTS_PREFIX
+def test_interactive_commands_help_and_clear_context(tmp_path):
+    # Simulates /help, /c-context, then exit
+    with mock.patch("builtins.input", side_effect=["/help", "/c-context", "exit"]), \
+         mock.patch("sys.stdout", new=io.StringIO()):
+        main(["--workspace", str(tmp_path)])
 
 
-def test_strip_roleplay_asterisks_streaming_and_helper():
-    # Helper test
-    raw = "*Assistant is online and ready to help.*"
-    cleaned = ui_mod.clean_roleplay_asterisks(raw)
-    assert cleaned == "Assistant is online and ready to help."
-
-    action_raw = "*Nods.* I can help you with this."
-    cleaned_action = ui_mod.clean_roleplay_asterisks(action_raw)
-    assert cleaned_action == "Nods. I can help you with this."
-
-    # Streaming test in TerminalHooks
-    out = io.StringIO()
-    hooks = ui_mod.TerminalHooks(stdout=out)
-    hooks.on_delta("*")
-    hooks.on_delta("Assistant is online")
-    hooks.on_delta(" and ready to help.*")
-    hooks.on_assistant_done(SimpleNamespace(content="*Assistant is online and ready to help.*"))
-
-    output = out.getvalue()
-    assert "Assistant is online and ready to help." in output
-    assert "*Assistant" not in output
-    assert "help.*" not in output
+def test_interactive_turn_ctrl_c_cancel(tmp_path):
+    # Simulates KeyboardInterrupt during agent.handle, then exit
+    with mock.patch("builtins.input", side_effect=["test query", "exit"]), \
+         mock.patch("assistant.agent.Agent.handle", side_effect=KeyboardInterrupt), \
+         mock.patch("sys.stdout", new=io.StringIO()) as fake_out:
+        main(["--workspace", str(tmp_path)])
+        output = fake_out.getvalue()
+        assert "Turn cancelled" in output
 
 
-def test_strip_roleplay_asterisks_preserves_bold_and_bullets():
-    bold_text = "**Important:** Do not delete files."
-    assert ui_mod.clean_roleplay_asterisks(bold_text) == bold_text
+def test_cmd_sessions_menu_save_and_load(tmp_path, monkeypatch):
+    monkeypatch.setattr("assistant.__main__.SESSIONS_DIR", tmp_path / "sessions")
+    sess_path = tmp_path / "current_session.json"
+    session = Session(sess_path)
+    session.append("user", "Hello world")
 
-    bullet_list = "* item 1\n* item 2\n* item 3"
-    assert ui_mod.clean_roleplay_asterisks(bullet_list) == bullet_list
+    cfg = Config(workspace=tmp_path)
+    from assistant.agent import Agent
+    agent = Agent(cfg)
 
-    # Pure terminal streaming strips markdown asterisks cleanly
-    out_bold = io.StringIO()
-    hooks_bold = ui_mod.TerminalHooks(stdout=out_bold)
-    hooks_bold.on_delta("**Important:** Do not delete files.")
-    hooks_bold.on_assistant_done(SimpleNamespace(content="**Important:** Do not delete files."))
-    assert "Important: Do not delete files." in out_bold.getvalue()
-    assert "**" not in out_bold.getvalue()
+    # 1. Save session
+    with mock.patch("builtins.input", side_effect=["s", "my_session"]):
+        cmd_sessions(session, agent)
 
-    out_bullet = io.StringIO()
-    hooks_bullet = ui_mod.TerminalHooks(stdout=out_bullet)
-    hooks_bullet.on_delta("* First bullet\n* Second bullet")
-    hooks_bullet.on_assistant_done(SimpleNamespace(content="* First bullet\n* Second bullet"))
-    assert "- First bullet\n- Second bullet" in out_bullet.getvalue()
+    saved_file = tmp_path / "sessions" / "my_session.json"
+    assert saved_file.exists()
+
+    # Clear current session in memory
+    session.clear()
+    assert len(session.messages) == 0
+
+    # 2. Load session
+    with mock.patch("builtins.input", side_effect=["l", "1"]):
+        cmd_sessions(session, agent)
+
+    assert len(session.messages) == 1
+    assert session.messages[0]["content"] == "Hello world"
+    assert any(m.get("content") == "Hello world" for m in agent.messages)
+
+    # 3. Delete session
+    with mock.patch("builtins.input", side_effect=["d", "1", "y"]):
+        cmd_sessions(session, agent)
+
+    assert not saved_file.exists()
 
 
+def test_interactive_chat_turn_success(tmp_path):
+    # Simulates entering user query, receiving response, then exiting
+    mock_resp = {"content": "I am doing well!", "tool_calls": []}
+    with mock.patch("builtins.input", side_effect=["how are you?", "exit"]), \
+         mock.patch("assistant.llm.LLM.chat", return_value=mock_resp), \
+         mock.patch("sys.stdout", new=io.StringIO()) as fake_out:
+        main(["--workspace", str(tmp_path)])
+        output = fake_out.getvalue()
+        assert "Assistant:" in output
+        assert "I am doing well!" in output
+
+
+def test_interactive_user_prompt_formatting(tmp_path):
+    prompts_captured = []
+
+    def fake_input(prompt=""):
+        prompts_captured.append(prompt)
+        return "exit"
+
+    with mock.patch("builtins.input", side_effect=fake_input), \
+         mock.patch("sys.stdout", new=io.StringIO()):
+        main(["--workspace", str(tmp_path)])
+
+    assert len(prompts_captured) >= 1
+    assert "\033[1mYou:\033[0m " in prompts_captured[0]
+
+
+def test_verbose_cli_flags(tmp_path):
+    mock_resp = {
+        "content": "Test response",
+        "tool_calls": [],
+        "stats": {"eval_count": 10, "eval_rate": 20.0, "total_duration_s": 0.5},
+    }
+
+    # 1. Default verbose is enabled
+    with mock.patch("builtins.input", side_effect=["test", "exit"]), \
+         mock.patch("assistant.llm.LLM.chat", return_value=mock_resp), \
+         mock.patch("sys.stdout", new=io.StringIO()) as fake_out:
+        main(["--workspace", str(tmp_path)])
+        assert "10 tokens" in fake_out.getvalue()
+
+    # 2. Explicit --no-verbose disables stats
+    with mock.patch("builtins.input", side_effect=["test", "exit"]), \
+         mock.patch("assistant.llm.LLM.chat", return_value=mock_resp), \
+         mock.patch("sys.stdout", new=io.StringIO()) as fake_out_no_verb:
+        main(["--workspace", str(tmp_path), "--no-verbose"])
+        assert "10 tokens" not in fake_out_no_verb.getvalue()

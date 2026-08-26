@@ -9,7 +9,11 @@ from assistant.tools import Tool, ToolResult
 
 TOOL_SPEC = {
     "name": "get_current_time",
-    "description": "Get current date and time (ISO, UTC, local).",
+    "description": (
+        "Get current date and time information (ISO, UTC, local, year, month, day, weekday, timezone). "
+        "The model MUST call get_current_time BEFORE calling websearch or webfetch so it knows the current "
+        "date, month, and year to find and evaluate the freshest information relative to today."
+    ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
@@ -21,10 +25,11 @@ def _now_payload() -> dict:
         "iso": now.isoformat(),
         "utc": now.isoformat(),
         "local": local.isoformat(),
-        "year": now.year,
-        "month": now.month,
-        "day": now.day,
-        "weekday": now.strftime("%A"),
+        "year": local.year,
+        "month": local.month,
+        "day": local.day,
+        "weekday": local.strftime("%A"),
+        "tz_name": local.tzname() or "",
     }
 
 

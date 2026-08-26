@@ -1,353 +1,234 @@
-"""Command-line entry point for assistant (TUI + headless modes)."""
+"""CLI entry point for assistant."""
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Any
 
-VERSION = "0.1.0"
-DEFAULT_CONFIG_PATH = Path.home() / ".assistant" / "config.toml"
+from assistant.config import load_config
+from assistant.session import Session
 
-# Pure ANSI, no new deps — eye-comfort dim for banner/footer.
-ANSI_DIM = "\033[2m"
-ANSI_RESET = "\033[0m"
+VERSION = "0.2.0"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
 
-SAMPLE_CONFIG = '''\
-# assistant configuration (sample, written once)
-# All keys optional; unset values fall back to built-in defaults.
-
-model = "qwen2.5-coder:7b"              # any model available in Ollama
-base_url = "http://127.0.0.1:11434/v1"  # Ollama OpenAI-compatible endpoint
-api_key = "ollama"                      # placeholder; local servers ignore it
-max_tool_rounds = 12                    # default: 25
-stream = true                           # stream assistant tokens
-verbose = false                         # show Ollama performance stats after each turn
-timeout_s = 600                         # request timeout in seconds (potato: 600)
-max_context_tokens = 12000              # pruning limit, match your 12k local model
-# workspace = ""                        # empty -> directory you launch from
-# shell_cmd = ["powershell", "-NoProfile", "-Command"]  # Windows default
-# system_prompt = "You are Assistant, coding agent in workspace. Never call tools for greetings or general chat; answer directly with text. Call tools only for workspace tasks, coding, file operations, or web search. Always list_files before read_file. Match user language. Be concise, no intro/outro, >20 lines -> file."
-# identity = "Assistant, coding agent in workspace."  # separate identity
-
-# [prompt]
-# system = """You are Assistant, coding agent in workspace. Never call tools for greetings or general chat; answer directly with text. Call tools only for workspace tasks, coding, file operations, or web search. Always list_files before read_file. Match user language. Be concise, no intro/outro, >20 lines -> file."""
-
-# [identity]
-# name = "Assistant"
-# role = "coding agent in workspace"
-# Example: paste your universal prompt & identity above and restart. Code stays clean, prompt lives in config.
-
-[permissions]
-# one of: "allow" | "ask" | "deny"
-write = "allow"                         # set "ask" to confirm every file write
-delete = "ask"
-shell = "ask"
-webfetch = "allow"
-websearch = "allow"
-
-[limits]
-# resource caps applied to tool outputs
-# read_max_lines = 200
-# shell_timeout_s = 120
-# shell_output_chars = 6000
-# webfetch_chars = 8000
-# list_max_entries = 200
-'''
+SESSIONS_DIR = Path.home() / ".assistant" / "sessions"
 
 
-def build_console_hooks(hooks_base: type) -> type:
-    """Create the concrete ConsoleHooks class bound to the given Hooks base."""
-
-    class ConsoleHooksImpl(hooks_base):
-        def __init__(self, verbose: bool = False) -> None:
-            self.had_error = False
-            self.verbose: bool = bool(verbose)
-
-        def _format_verbose(self, turn) -> str:
-            stats = getattr(turn, "stats", None)
-            if stats is None and isinstance(turn, dict):
-                stats = turn.get("stats")
-            if not stats:
-                return "(no stats)"
-
-            def _get(key: str, default=None):
-                if isinstance(stats, dict):
-                    if key in stats:
-                        return stats[key]
-                    ollama = stats.get("ollama")
-                    if isinstance(ollama, dict) and key in ollama:
-                        return ollama[key]
-                    return default
-                else:
-                    if hasattr(stats, key):
-                        return getattr(stats, key)
-                    ollama = getattr(stats, "ollama", None)
-                    if ollama is not None:
-                        if isinstance(ollama, dict) and key in ollama:
-                            return ollama[key]
-                        if hasattr(ollama, key):
-                            return getattr(ollama, key)
-                    return default
-
-            parts = ["verbose"]
-            wall = _get("wall_duration_s")
-            if wall is not None:
-                try:
-                    parts.append(f"wall {float(wall):.1f}s")
-                except Exception:
-                    pass
-            prompt_count = _get("prompt_eval_count")
-            prompt_dur = _get("prompt_eval_duration")
-            if prompt_count is not None:
-                try:
-                    pc = int(prompt_count)
-                    if prompt_dur is not None:
-                        pd_s = float(prompt_dur) / 1e9 if float(prompt_dur) > 1e6 else float(prompt_dur)
-                        parts.append(f"prompt {pc} tok ({pd_s:.2f}s)")
-                    else:
-                        parts.append(f"prompt {pc} tok")
-                except Exception:
-                    pass
-            eval_count = _get("eval_count")
-            eval_dur = _get("eval_duration")
-            if eval_count is not None:
-                try:
-                    ec = int(eval_count)
-                    if eval_dur is not None:
-                        ed_s = float(eval_dur) / 1e9 if float(eval_dur) > 1e6 else float(eval_dur)
-                        if ed_s > 0:
-                            tok_per_s = ec / ed_s
-                            parts.append(f"eval {ec} tok {tok_per_s:.2f}tok/s")
-                        else:
-                            parts.append(f"eval {ec} tok")
-                    else:
-                        parts.append(f"eval {ec} tok")
-                except Exception:
-                    pass
-            total_dur = _get("total_duration")
-            if total_dur is not None:
-                try:
-                    td = float(total_dur)
-                    td_s = td / 1e9 if td > 1e6 else td
-                    if td_s >= 1:
-                        parts.append(f"total {td_s:.1f}s")
-                    else:
-                        parts.append(f"total {td_s*1000:.1f}ms")
-                except Exception:
-                    pass
-            load_dur = _get("load_duration")
-            if load_dur is not None:
-                try:
-                    ld = float(load_dur)
-                    if ld > 1e6:
-                        parts.append(f"load {ld/1e6:.1f}ms")
-                    elif ld > 1e3:
-                        parts.append(f"load {ld:.1f}ms")
-                    else:
-                        parts.append(f"load {ld:.2f}s")
-                except Exception:
-                    pass
-            if prompt_count is None and eval_count is None:
-                approx = _get("approx_tokens")
-                if approx is None:
-                    approx = _get("approx_tokens_before")
-                if approx is not None:
-                    try:
-                        parts.append(f"~{int(approx)} tok")
-                    except Exception:
-                        pass
-            if len(parts) == 1:
-                return "(no stats)"
-            return " | ".join(parts)
-
-        def on_start(self) -> None:
-            # Immediate TTFT feedback for headless mode
-            print("… thinking…", file=sys.stderr, flush=True)
-
-        def on_delta(self, text: str) -> None:
-            sys.stdout.write(text)
-            sys.stdout.flush()
-
-        def on_reasoning(self, text: str) -> None:
-            # keep stdout clean for the actual answer; thinking goes to stderr
-            sys.stderr.write(text)
-            sys.stderr.flush()
-
-        def on_assistant_done(self, turn: Any) -> None:
-            if isinstance(turn, dict):
-                content = turn.get("content")
-            elif isinstance(turn, str):
-                content = turn
-            else:
-                content = getattr(turn, "text", "")
-                if content is None:
-                    content = getattr(turn, "content", "")
-            if isinstance(content, str) and content and not content.endswith("\n"):
-                print()
-            if getattr(self, "verbose", False):
-                try:
-                    line = self._format_verbose(turn)
-                except Exception:
-                    line = "(no stats)"
-                print(f"{ANSI_DIM}⏱ {line}{ANSI_RESET}", file=sys.stderr, flush=True)
-
-        def on_tool_start(self, name: str, args: dict) -> None:
-            import json as _json
-
-            try:
-                compact = _json.dumps(args, separators=(",", ":"), default=str)
-            except (TypeError, ValueError):
-                compact = str(args)
-            print(f"-> tool {name} {compact}", flush=True)
-
-        def on_tool_result(self, name: str, res: Any) -> None:
-            out = " ".join(str(getattr(res, "output", "")).split())
-            marker = "" if getattr(res, "ok", True) else " [ERROR]"
-            print(f"<- {name}: {out[:200]}{marker}", flush=True)
-
-        def on_status(self, info: dict) -> None:
-            round_no = info.get("round", "?")
-            max_rounds = info.get("max", "?")
-            approx_tokens = info.get("approx_tokens", "?")
-            print(
-                f"[status] round {round_no}/{max_rounds} ~{approx_tokens} tok",
-                file=sys.stderr,
-                flush=True,
-            )
-
-        def on_permission(self, name: str, args: dict) -> bool:
-            if not sys.stdin.isatty():
-                # Piped/non-interactive stdin (-p mode): never auto-authorize,
-                # and keep stdout pure by not emitting the prompt at all.
-                return False
-            try:
-                answer = input(f"Allow {name}? [y/N] ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                return False
-            return answer in {"y", "yes"}
-
-        def on_error(self, msg: str) -> None:
-            self.had_error = True
-            print(f"ERROR: {msg}", file=sys.stderr, flush=True)
-
-    return ConsoleHooksImpl
+def clear_screen():
+    os.system("cls" if os.name == "nt" else "clear")
 
 
-def load_runtime():
-    """Import sibling modules; returns tuple or raises ImportError."""
-    from assistant.agent import Agent, Hooks
-    from assistant.config import load_config
-    from assistant.llm import LLMClient
-    from assistant.tools import get_tools
-
-    return load_config, LLMClient, Agent, Hooks, get_tools
+def print_banner(config):
+    clear_screen()
+    print(f"{CYAN}{BOLD}Assistant{RESET} {DIM}v{VERSION} · {config.model} · {config.workspace}{RESET}")
+    print(f"{DIM}commands: /sessions /clear /c-context /help exit{RESET}\n")
 
 
-def ensure_sample_config(config_path: Path) -> None:
-    """Write a commented sample config.toml once if the location is writable."""
-    if config_path.exists():
+def cmd_sessions(session, agent):
+    """Interactive session management."""
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"\n{CYAN}--- Sessions ---{RESET}")
+    print(f"  {BOLD}[s]{RESET} Save current session")
+    print(f"  {BOLD}[l]{RESET} Load session")
+    print(f"  {BOLD}[d]{RESET} Delete session")
+    print(f"  {BOLD}[b]{RESET} Back to chat")
+    print()
+
+    try:
+        choice = input(f"{DIM}choice: {RESET}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"{RESET}\n{DIM}cancelled{RESET}")
         return
+
+    if choice == "s":
+        try:
+            name = input(f"{DIM}session name: {RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"{RESET}\n{DIM}cancelled{RESET}")
+            return
+        if not name:
+            print(f"{DIM}cancelled{RESET}")
+            return
+        sess_path = SESSIONS_DIR / f"{name}.json"
+        session.path = sess_path
+        session.save()
+        print(f"{GREEN}saved to {sess_path}{RESET}")
+
+    elif choice == "l":
+        files = list(SESSIONS_DIR.glob("*.json"))
+        if not files:
+            print(f"{DIM}no saved sessions{RESET}")
+            return
+        print(f"\n{CYAN}Saved sessions:{RESET}")
+        for i, f in enumerate(files, 1):
+            print(f"  {BOLD}[{i}]{RESET} {f.stem}")
+        print()
+        try:
+            idx = input(f"{DIM}pick number: {RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"{RESET}\n{DIM}cancelled{RESET}")
+            return
+        try:
+            chosen = files[int(idx) - 1]
+        except (ValueError, IndexError):
+            print(f"{DIM}invalid{RESET}")
+            return
+        session.path = chosen
+        loaded = Session.load(chosen)
+        session.messages = loaded.messages
+        # Reload agent context
+        agent.clear_context()
+        for msg in session.messages:
+            if msg.get("role") in ("user", "assistant"):
+                agent.messages.append(msg)
+        print(f"{GREEN}loaded {chosen.stem} ({len(session.messages)} messages){RESET}")
+
+    elif choice == "d":
+        files = list(SESSIONS_DIR.glob("*.json"))
+        if not files:
+            print(f"{DIM}no saved sessions{RESET}")
+            return
+        print(f"\n{CYAN}Saved sessions:{RESET}")
+        for i, f in enumerate(files, 1):
+            print(f"  {BOLD}[{i}]{RESET} {f.stem}")
+        print()
+        try:
+            idx = input(f"{DIM}pick number to delete: {RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"{RESET}\n{DIM}cancelled{RESET}")
+            return
+        try:
+            chosen = files[int(idx) - 1]
+        except (ValueError, IndexError):
+            print(f"{DIM}invalid{RESET}")
+            return
+        try:
+            confirm = input(f"{YELLOW}delete '{chosen.stem}'? [y/N]: {RESET}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(f"{RESET}\n{DIM}cancelled{RESET}")
+            return
+        if confirm == "y":
+            chosen.unlink()
+            print(f"{GREEN}deleted{RESET}")
+        else:
+            print(f"{DIM}cancelled{RESET}")
+
+
+def print_help():
+    print(f"\n{CYAN}--- Commands ---{RESET}")
+    print(f"  {BOLD}/sessions{RESET}  save, load, delete sessions")
+    print(f"  {BOLD}/clear{RESET}     clear screen only")
+    print(f"  {BOLD}/c-context{RESET} clear conversation context + screen")
+    print(f"  {BOLD}/help{RESET}      show this help")
+    print(f"  {BOLD}exit{RESET}       quit")
+    print()
+
+
+def main(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="assistant — lightweight terminal coding agent")
+    parser.add_argument("--version", action="version", version=f"assistant {VERSION}")
+    parser.add_argument("--config", type=Path, default=None, help="path to config.json")
+    parser.add_argument("--model", type=str, default=None, help="override model name")
+    parser.add_argument("--workspace", type=Path, default=None, help="override workspace path")
+    parser.add_argument("--no-stream", action="store_true", help="disable streaming")
+    parser.add_argument("--verbose", action="store_true", default=None, help="enable Ollama generation stats")
+    parser.add_argument("--no-verbose", action="store_true", help="disable Ollama generation stats")
+    parser.add_argument("-c", "--command", type=str, default=None, help="headless: run one command and exit")
+    parser.add_argument("-p", "--prompt", type=str, default=None, help="headless: run one prompt and exit")
+    args = parser.parse_args(argv)
+
+    # Load config
+    config_path = args.config or (Path.home() / ".assistant" / "config.json")
+    config = load_config(config_path)
+
+    # CLI overrides
+    if args.model:
+        config.model = args.model
+    if args.workspace:
+        config.workspace = args.workspace.resolve()
+    if args.no_stream:
+        config.stream = False
+    if args.no_verbose:
+        config.verbose = False
+    elif args.verbose:
+        config.verbose = True
+
+    # Ensure workspace exists
+    config.workspace.mkdir(parents=True, exist_ok=True)
+
+    from assistant.agent import Agent
+    agent = Agent(config)
+
+    # Headless mode
+    prompt = args.command if args.command is not None else args.prompt
+    if prompt is not None:
+        try:
+            response = agent.handle(prompt)
+        except KeyboardInterrupt:
+            print(f"{RESET}\n{YELLOW}[Cancelled]{RESET}", file=sys.stderr)
+            sys.exit(130)
+        return
+
+    # Interactive mode
+    session = Session.load(config.workspace / ".assistant_session.json")
+    print_banner(config)
+
     try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        if os.access(config_path.parent, os.W_OK):
-            config_path.write_text(SAMPLE_CONFIG, encoding="utf-8")
-            print(f"{ANSI_DIM}[info] sample config written: {config_path}{ANSI_RESET}", file=sys.stderr)
-    except OSError:
-        pass  # read-only home etc. -> keep built-in defaults silently
+        while True:
+            try:
+                user_input = input(f"{BOLD}You:{RESET} ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(f"{RESET}\n{DIM}Goodbye!{RESET}")
+                break
+            if not user_input:
+                continue
 
+            # Commands
+            cmd = user_input.lower()
+            if cmd in ("exit", "quit", "/exit", "/quit"):
+                print(f"{RESET}\n{DIM}Goodbye!{RESET}")
+                break
+            elif cmd == "/clear":
+                clear_screen()
+                print_banner(config)
+                continue
+            elif cmd == "/c-context":
+                agent.clear_context()
+                session.messages = []
+                session.save()
+                clear_screen()
+                print_banner(config)
+                print(f"\n{GREEN}Context cleared.{RESET}")
+                continue
+            elif cmd == "/sessions":
+                cmd_sessions(session, agent)
+                continue
+            elif cmd == "/help":
+                print_help()
+                continue
 
-def build_parser():  # lazy argparse -> keep import time <1s
-    import argparse as _argparse
+            try:
+                response = agent.handle(user_input)
 
-    parser = _argparse.ArgumentParser(
-        prog="assistant",
-        description="Minimal TUI coding agent for local models (Ollama).",
-    )
-    parser.add_argument(
-        "--version",
-        action="store_true",
-        help="print version and exit",
-    )
-    parser.add_argument("--model", help="model name, e.g. qwen2.5-coder:7b")
-    parser.add_argument("--base-url", dest="base_url", metavar="URL", help="Ollama OpenAI-compatible base URL")
-    parser.add_argument("--workspace", metavar="DIR", help="workspace directory (default: current directory)")
-    parser.add_argument(
-        "--config",
-        default=str(DEFAULT_CONFIG_PATH),
-        metavar="PATH",
-        help=f"config file path (default: {DEFAULT_CONFIG_PATH})",
-    )
-    parser.add_argument(
-        "-p",
-        "--print",
-        dest="print_mode",
-        metavar="TEXT",
-        help="headless mode: run TEXT non-interactively, print result, exit",
-    )
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="show Ollama performance stats after each response",
-    )
-    return parser
+                session.append("user", user_input)
+                session.append("assistant", response)
+                session.save()
+            except KeyboardInterrupt:
+                print(f"{RESET}\n{YELLOW}[Turn cancelled]{RESET}")
+                continue
 
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    ns = parser.parse_args(argv)
-
-    if ns.version:
-        print(f"assistant {VERSION}")
-        return 0
-
-    # Sibling modules are built in parallel; fail with a clear message, never at import time.
-    try:
-        load_config, LLMClient, Agent, Hooks, get_tools = load_runtime()
-    except ImportError as exc:
-        print(f"ERROR: core modules not available yet ({exc}). Run 'pip install -e .' "
-              f"and ensure all assistant modules are present.", file=sys.stderr)
-        return 2
-
-    config_path = Path(ns.config).expanduser()
-    if config_path == DEFAULT_CONFIG_PATH:
-        ensure_sample_config(config_path)
-
-    overrides: dict[str, Any] = {}
-    if ns.model:
-        overrides["model"] = ns.model
-    if ns.base_url:
-        overrides["base_url"] = ns.base_url
-    if getattr(ns, "verbose", False):
-        overrides["verbose"] = True
-    overrides["workspace"] = Path(ns.workspace or ".").expanduser().resolve()
-
-    try:
-        config = load_config(str(config_path) if config_path.exists() else None, overrides or None)
-    except Exception as exc:  # noqa: BLE001 - surface config errors cleanly
-        print(f"ERROR: failed to load config {config_path}: {exc}", file=sys.stderr)
-        return 2
-
-    client = LLMClient(config.base_url, config.api_key, config.model, timeout_s=int(getattr(config, "timeout_s", 600)))
-    tools = get_tools(config.workspace, config)
-
-    if ns.print_mode is not None:
-        console_hooks = build_console_hooks(Hooks)(verbose=bool(getattr(config, "verbose", False)))
-        agent = Agent(client, tools, config, console_hooks)
-        agent.submit(ns.print_mode)
-        return 1 if console_hooks.had_error else 0
-
-    from assistant.ui import run_repl
-
-    agent = Agent(client, tools, config, Hooks())
-    try:
-        run_repl(agent, config)
-    except (KeyboardInterrupt, EOFError):
-        pass
-    return 0
+    finally:
+        session.save()
+        sys.stdout.write(RESET)
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
