@@ -73,27 +73,22 @@ def _strip_fences(s: str) -> str:
 _TOOL_LEAK_PATTERNS = (
     re.compile(r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>", re.IGNORECASE),
     re.compile(r"\[\/?(?:TOOL_CALLS?|TOOLS|ACTIONS?)\]", re.IGNORECASE),
-    re.compile(r">tool_calls?", re.IGNORECASE),
-    re.compile(r">\s*[\{\[]", re.IGNORECASE),
-    re.compile(r"\btool_calls?\s*:\s*\[", re.IGNORECASE),
-    re.compile(r"\[\s*[a-zA-Z0-9_]+\s*(?:\(.*?\))?\s*\]"),
+    re.compile(r">\s*tool_calls?\b", re.IGNORECASE),
+    re.compile(r"\btool_calls?\s*:\s*\[\s*\{", re.IGNORECASE),
     re.compile(r'\{\s*"type"\s*:\s*"function"', re.IGNORECASE),
-    re.compile(r'\{\s*"function"\s*:\s*\{', re.IGNORECASE),
-    re.compile(r'\{\s*"n+a+m+e+"\s*:', re.IGNORECASE),
+    re.compile(r'\{\s*"n+a+m+e+"\s*:\s*"[a-zA-Z0-9_]+"\s*,\s*"arguments"', re.IGNORECASE),
 )
 
 
 def _looks_like_tool_leak(s: str) -> bool:
     if not s:
         return False
-    if '"name"' in s and ('"arguments"' in s or '"query"' in s or '"path"' in s or '"command"' in s or '"content"' in s):
-        return True
     if any(p.search(s) for p in _TOOL_LEAK_PATTERNS):
         return True
     t = _strip_fences(s).strip()
-    if t.startswith("{") and ('"name"' in t or '"function"' in t or '"tool"' in t):
-        return True
-    if "```json" in s and ('"name"' in s or any(p.search(s) for p in _TOOL_LEAK_PATTERNS)):
+    if t.startswith(">"):
+        t = t.lstrip("> \t").strip()
+    if t.startswith("{") and ('"name":' in t or '"name" :' in t or '"naame":' in t) and ('"arguments"' in t or '"parameters"' in t):
         return True
     return False
 
@@ -257,14 +252,9 @@ class LLMClient:
                             content_parts.append(text)
                             accum = "".join(content_parts)
                             stripped = accum.strip()
-                            # Suppress tool JSON, XML tags, fences, or unclosed tool brackets
-                            if ('"name"' in text and '"arguments"' in text) or ('"name"' in accum and '"arguments"' in accum):
+                            if _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass
-                            elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
-                                pass
-                            elif ('"name"' in accum) or ('"function"' in accum) or ('"arguments"' in accum) or ('"naame"' in accum):
-                                pass
-                            elif stripped.startswith(("{", "```", "<tools", "<tool_call", ">", "[TOOL_CALL")):
+                            elif stripped.startswith(("<tools", "<tool_call", ">tool_call", "[TOOL_CALL")):
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
@@ -308,13 +298,9 @@ class LLMClient:
                             content_parts.append(text)
                             accum = "".join(content_parts)
                             stripped = accum.strip()
-                            if ('"name"' in text and '"arguments"' in text) or ('"name"' in accum and '"arguments"' in accum):
+                            if _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass
-                            elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
-                                pass
-                            elif ('"name"' in accum) or ('"function"' in accum) or ('"arguments"' in accum) or ('"naame"' in accum):
-                                pass
-                            elif stripped.startswith(("{", "```", "<tools", "<tool_call", ">", "[TOOL_CALL")):
+                            elif stripped.startswith(("<tools", "<tool_call", ">tool_call", "[TOOL_CALL")):
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
