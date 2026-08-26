@@ -185,7 +185,10 @@ def main(argv: list[str] | None = None):
             try:
                 user_input = input(f"{BOLD}You:{RESET} ").strip()
             except (EOFError, KeyboardInterrupt):
-                print(f"{RESET}\n{DIM}Goodbye!{RESET}")
+                try:
+                    print(f"{RESET}\n{DIM}Goodbye!{RESET}")
+                except Exception:
+                    pass
                 break
             if not user_input:
                 continue
@@ -193,7 +196,10 @@ def main(argv: list[str] | None = None):
             # Commands
             cmd = user_input.lower()
             if cmd in ("exit", "quit", "/exit", "/quit"):
-                print(f"{RESET}\n{DIM}Goodbye!{RESET}")
+                try:
+                    print(f"{RESET}\n{DIM}Goodbye!{RESET}")
+                except Exception:
+                    pass
                 break
             elif cmd == "/clear":
                 clear_screen()
@@ -221,13 +227,21 @@ def main(argv: list[str] | None = None):
                 session.append("assistant", response)
                 session.save()
             except KeyboardInterrupt:
-                print(f"{RESET}\n{YELLOW}[Turn cancelled]{RESET}")
+                try:
+                    print(f"{RESET}\n{YELLOW}[Turn cancelled]{RESET}")
+                except Exception:
+                    pass
                 continue
 
+    except (KeyboardInterrupt, EOFError):
+        pass
     finally:
-        session.save()
-        sys.stdout.write(RESET)
-        sys.stdout.flush()
+        try:
+            session.save()
+            sys.stdout.write(RESET)
+            sys.stdout.flush()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -761,7 +761,7 @@ class TypewriterStreamer:
         self._safe_write("\r\x1b[2K")
         for _ in range(self._thinking_lines):
             self._safe_write("\x1b[1A\x1b[2K")
-        self._safe_write(f"{GREEN}✔{RESET} {self.dark_color_code}Thought in {elapsed:.1f}s{RESET}\n")
+        self._safe_write(f"{GREEN}✔{RESET}  {self.dark_color_code}Thought in {elapsed:.1f}s{RESET}\n")
         self._in_thinking = False
         self._thinking_done = True
         self._has_trailing_newline = True
