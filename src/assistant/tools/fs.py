@@ -111,7 +111,7 @@ def read_file_tool(workspace: pathlib.Path, config) -> Tool:
             if target is None:
                 return ToolResult(False, _OUTSIDE)
             if not target.is_file():
-                return ToolResult(False, f"ERROR: not a file: {raw}")
+                return ToolResult(False, f"ERROR: not a file: {raw} — hint: call list_files with path '.' to discover files first, never guess")
             size = target.stat().st_size
             if size > _MAX_READ_BYTES:
                 return ToolResult(

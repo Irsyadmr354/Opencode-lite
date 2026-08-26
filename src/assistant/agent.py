@@ -12,8 +12,9 @@ from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for t
 SYSTEM_PROMPT = (
     "You are Assistant, coding agent in workspace. Tools: get_current_time, websearch, "
     "webfetch, read_file, write_file, delete_file, list_files, shell. Only for "
-    "current/news/search: call get_current_time then web_search with date. For hi/chat "
-    "answer directly no tools. Never output JSON as text use tool_calls. No intro/outro."
+    "current/news/search: call get_current_time then web_search with date. Before "
+    "read_file always list_files with '.' to discover files, never guess. For hi/chat "
+    "answer directly. Never output JSON. No intro/outro."
 )
 
 

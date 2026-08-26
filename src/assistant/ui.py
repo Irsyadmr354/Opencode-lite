@@ -183,11 +183,14 @@ def _tag_holdback(buffer: str, in_think: bool, at_line_start: bool = False) -> i
 
 
 def _is_tool_json_display(s: str) -> bool:
+    # aggressive: any leaked tool JSON (fenced or raw) should be hidden
+    if '"name"' in s and '"arguments"' in s:
+        return True
     t = s.strip()
     if t.startswith("```"):
         t = re.sub(r"^```[a-z]*\s*\n?", "", t, flags=re.IGNORECASE)
         t = re.sub(r"\n?```\s*$", "", t).strip()
-    return t.startswith("{") and '"name"' in t and '"arguments"' in t
+    return t.startswith("{") and '"name"' in t
 
 
 def _parse_thinking_text(text: str, state: dict[str, bool]):  # type: ignore[no-untyped-def]
