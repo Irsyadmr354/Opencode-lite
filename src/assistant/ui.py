@@ -118,9 +118,11 @@ _UI_TOOL_LEAK_RE = re.compile(
     r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>|"
     r"\[\/?(?:TOOL_CALLS?|TOOLS|ACTIONS?)\]|"
     r">tool_calls?|"
+    r">\s*[\{\[]|"
     r"\btool_calls?\s*:\s*\[|"
     r"\{\s*\"type\"\s*:\s*\"function\"|"
     r"\{\s*\"function\"\s*:\s*\{|"
+    r"\{\s*\"n+a+m+e+\"\s*:|"
     r"\[\s*[a-zA-Z0-9_]+\s*(?:\(.*?\))?\s*\]",
     re.IGNORECASE,
 )
@@ -129,17 +131,19 @@ _UI_TOOL_LEAK_RE = re.compile(
 def _is_tool_json_display(s: str) -> bool:
     if not s:
         return False
-    if '"name"' in s and ('"arguments"' in s or '"path"' in s or '"query"' in s or '"command"' in s or '"content"' in s):
+    if ('"name"' in s or '"naame"' in s) and ('"arguments"' in s or '"path"' in s or '"query"' in s or '"command"' in s or '"content"' in s):
         return True
     if _UI_TOOL_LEAK_RE.search(s):
         return True
     t = s.strip()
+    if t.startswith(">"):
+        t = t.lstrip("> \t").strip()
     if t.startswith("```"):
         t = re.sub(r"^```[a-z]*\s*\n?", "", t, flags=re.IGNORECASE)
         t = re.sub(r"\n?```\s*$", "", t).strip()
-    if t.startswith("{") and ('"name"' in t or '"function"' in t or '"tool"' in t):
+    if t.startswith("{") and ('"name"' in t or '"naame"' in t or '"function"' in t or '"tool"' in t):
         return True
-    if "```json" in s and ('"name"' in s or _UI_TOOL_LEAK_RE.search(s)):
+    if "```json" in s and ('"name"' in s or '"naame"' in s or _UI_TOOL_LEAK_RE.search(s)):
         return True
     return False
 

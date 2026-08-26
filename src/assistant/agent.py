@@ -53,6 +53,7 @@ def _sanitize_turn_content(content: str | None, config: Config | None = None) ->
     cleaned = re.sub(r">tool_calls?\s*\[[^\]]*\]", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r">tool_calls?\s*\{.*?\}", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r">?\s*\{\s*\"n+a+m+e+\".*?(?:\}|$)", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r"\{\s*\"type\"\s*:\s*\"function\".*?\}", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = cleaned.strip()
 

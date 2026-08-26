@@ -482,3 +482,17 @@ def test_nested_arguments_unwrapped(harness):
     assert len(read_tool.calls) == 1
     assert read_tool.calls[0]["path"] == "./time_info.txt"
     assert read_tool.calls[0]["start_line"] == 1
+
+
+def test_raw_tool_typo_and_leading_arrow_fallback(harness):
+    time_tool = StubTool(name="get_current_time")
+    hooks = RecordingHooks()
+    leak_reply = {
+        "content": '>{"naame": "get_current_time", "arguments',
+        "finish_reason": "stop",
+    }
+    agent = harness([leak_reply, CONTENT_REPLY], tools=[time_tool], hooks=hooks)
+    agent.submit("hi")
+
+    assert len(time_tool.calls) == 1
+    assert "naame" not in agent.messages[-1]["content"]

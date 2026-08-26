@@ -74,10 +74,12 @@ _TOOL_LEAK_PATTERNS = (
     re.compile(r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>", re.IGNORECASE),
     re.compile(r"\[\/?(?:TOOL_CALLS?|TOOLS|ACTIONS?)\]", re.IGNORECASE),
     re.compile(r">tool_calls?", re.IGNORECASE),
+    re.compile(r">\s*[\{\[]", re.IGNORECASE),
     re.compile(r"\btool_calls?\s*:\s*\[", re.IGNORECASE),
     re.compile(r"\[\s*[a-zA-Z0-9_]+\s*(?:\(.*?\))?\s*\]"),
     re.compile(r'\{\s*"type"\s*:\s*"function"', re.IGNORECASE),
     re.compile(r'\{\s*"function"\s*:\s*\{', re.IGNORECASE),
+    re.compile(r'\{\s*"n+a+m+e+"\s*:', re.IGNORECASE),
 )
 
 
@@ -260,9 +262,9 @@ class LLMClient:
                                 pass
                             elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass
-                            elif ('"name"' in accum) or ('"function"' in accum) or ('"arguments"' in accum):
+                            elif ('"name"' in accum) or ('"function"' in accum) or ('"arguments"' in accum) or ('"naame"' in accum):
                                 pass
-                            elif stripped.startswith(("{", "```", "<tools", "<tool_call", ">tool_call", "[TOOL_CALL")):
+                            elif stripped.startswith(("{", "```", "<tools", "<tool_call", ">", "[TOOL_CALL")):
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
@@ -310,9 +312,9 @@ class LLMClient:
                                 pass
                             elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass
-                            elif ('"name"' in accum) or ('"function"' in accum) or ('"arguments"' in accum):
+                            elif ('"name"' in accum) or ('"function"' in accum) or ('"arguments"' in accum) or ('"naame"' in accum):
                                 pass
-                            elif stripped.startswith(("{", "```", "<tools", "<tool_call", ">tool_call", "[TOOL_CALL")):
+                            elif stripped.startswith(("{", "```", "<tools", "<tool_call", ">", "[TOOL_CALL")):
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
@@ -399,9 +401,9 @@ class LLMClient:
                         pass
                 tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=fn_name, arguments=args if isinstance(args, dict) else {}))
 
-            # 2. Check for raw json function call strings (including ```json fences and truncated JSON)
-            if not tool_calls and ('"name"' in raw_content):
-                for m in re.finditer(r'\{[^{}]*?"name"\s*:\s*"([^"]+)"', raw_content, re.DOTALL):
+            # 2. Check for raw json function call strings (including ```json fences, >{...}, and truncated JSON)
+            if not tool_calls and ('"name"' in raw_content or '"naame"' in raw_content or '"function"' in raw_content):
+                for m in re.finditer(r'\{[^{}]*?"n+a+m+e+"\s*:\s*"([^"]+)"', raw_content, re.DOTALL | re.IGNORECASE):
                     name = m.group(1)
                     start_idx = m.start()
                     sub = raw_content[start_idx:]
@@ -491,6 +493,7 @@ class LLMClient:
             clean_content = re.sub(r">tool_calls?\s*\[[^\]]*\]", "", clean_content, flags=re.IGNORECASE)
             clean_content = re.sub(r"<\/?(?:tools|tool_calls?|function_calls?|actions?)>", "", clean_content, flags=re.IGNORECASE)
             clean_content = re.sub(r">tool_calls?\s*\{.*?\}", "", clean_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_content = re.sub(r">?\s*\{\s*\"n+a+m+e+\".*?(?:\}|$)", "", clean_content, flags=re.DOTALL | re.IGNORECASE)
             clean_content = re.sub(r"\{\s*\"type\"\s*:\s*\"function\".*?\}", "", clean_content, flags=re.DOTALL | re.IGNORECASE)
             clean_content = clean_content.strip()
         reasoning_text = "".join(reasoning_parts) or None
