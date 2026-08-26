@@ -70,17 +70,31 @@ def _strip_fences(s: str) -> str:
     return s
 
 
-def _looks_like_tool_json(s: str) -> bool:
+_TOOL_LEAK_PATTERNS = (
+    re.compile(r">tool_calls?", re.IGNORECASE),
+    re.compile(r"<\/?tool_calls?>", re.IGNORECASE),
+    re.compile(r"\[(get_current_time|websearch|webfetch|read_file|write_file|delete_file|list_files|shell)[^\]]*\]", re.IGNORECASE),
+    re.compile(r"\btool_calls?\s*:\s*\[", re.IGNORECASE),
+)
+
+
+def _looks_like_tool_leak(s: str) -> bool:
     if not s:
         return False
     if '"name"' in s and ('"arguments"' in s or '"query"' in s or '"path"' in s or '"command"' in s or '"content"' in s):
         return True
-    t = _strip_fences(s).strip()
-    if t.startswith("{") and '"name"' in t:
+    if any(p.search(s) for p in _TOOL_LEAK_PATTERNS):
         return True
-    if "```json" in s and '"name"' in s:
+    t = _strip_fences(s).strip()
+    if t.startswith("{") and ('"name"' in t or '"function"' in t or '"tool"' in t):
+        return True
+    if "```json" in s and ('"name"' in s or any(p.search(s) for p in _TOOL_LEAK_PATTERNS)):
         return True
     return False
+
+
+def _looks_like_tool_json(s: str) -> bool:
+    return _looks_like_tool_leak(s)
 
 
 class LLMClient:
@@ -348,6 +362,18 @@ class LLMClient:
                 except Exception:
                     pass
 
+            # 1b. Check for >tool_calls [name] or >tool_calls [name(args)]
+            for m in re.finditer(r">tool_calls?\s*\[([a-zA-Z0-9_]+)(?:\((.*?)\))?\]", raw_content):
+                fn_name = m.group(1)
+                args_str = m.group(2) or ""
+                args = {}
+                if args_str:
+                    try:
+                        args = json.loads(args_str)
+                    except Exception:
+                        pass
+                tool_calls.append(ToolCall(id=f"call_{len(tool_calls)}", name=fn_name, arguments=args if isinstance(args, dict) else {}))
+
             # 2. Check for raw json function call strings (including ```json fences and truncated JSON)
             if not tool_calls and ('"name"' in raw_content):
                 for m in re.finditer(r'\{[^{}]*?"name"\s*:\s*"([^"]+)"', raw_content, re.DOTALL):
@@ -436,6 +462,13 @@ class LLMClient:
         # into conversation history. Surface it as reasoning only when the
         # native reasoning field stayed empty; otherwise discard it.
         clean_content, inline_thoughts = _separate_inline_thinking(raw_content)
+        if tool_calls:
+            clean_content = ""
+        else:
+            clean_content = re.sub(r">tool_calls?\s*\[[^\]]*\]", "", clean_content, flags=re.IGNORECASE)
+            clean_content = re.sub(r"<\/?tool_calls?>", "", clean_content, flags=re.IGNORECASE)
+            clean_content = re.sub(r">tool_calls?\s*\{.*?\}", "", clean_content, flags=re.DOTALL | re.IGNORECASE)
+            clean_content = clean_content.strip()
         reasoning_text = "".join(reasoning_parts) or None
         if reasoning_text is None and inline_thoughts.strip():
             reasoning_text = inline_thoughts

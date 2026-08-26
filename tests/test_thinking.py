@@ -304,3 +304,13 @@ def test_ui_hides_tool_json_leaks():
     assert '"name"' not in output
     assert '"write_file"' not in output
     assert '"arguments"' not in output
+
+
+def test_ui_hides_raw_tool_call_syntax():
+    out = io.StringIO()
+    hooks = ui_mod.TerminalHooks(stdout=out)
+    hooks.on_delta(">tool_calls [get_current_time]")
+    hooks.on_assistant_done(SimpleNamespace(content=">tool_calls [get_current_time]"))
+    output = out.getvalue()
+    assert ">tool_calls" not in output
+    assert "get_current_time" not in output

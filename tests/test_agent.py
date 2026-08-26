@@ -438,3 +438,14 @@ def test_truncated_tool_json_fallback(harness):
     assert len(write_tool.calls) == 1
     assert write_tool.calls[0]["path"] == "sample.txt"
     assert write_tool.calls[0]["content"] == "hello"
+
+
+def test_greeting_tool_call_leak_sanitized(harness):
+    hooks = RecordingHooks()
+    leak_reply = {"content": ">tool_calls [get_current_time]", "finish_reason": "stop"}
+    agent = harness([leak_reply], hooks=hooks)
+    agent.submit("hi")
+
+    assert ">tool_calls" not in agent.messages[-1]["content"]
+    assert "get_current_time" not in agent.messages[-1]["content"]
+    assert "Hello" in agent.messages[-1]["content"] or "assist" in agent.messages[-1]["content"]

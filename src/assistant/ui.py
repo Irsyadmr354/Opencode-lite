@@ -185,16 +185,21 @@ def _tag_holdback(buffer: str, in_think: bool, at_line_start: bool = False) -> i
 def _is_tool_json_display(s: str) -> bool:
     if not s:
         return False
-    # aggressive: any leaked tool JSON (fenced or raw) should be hidden
+    # aggressive: any leaked tool JSON or tool call syntax should be hidden
     if '"name"' in s and '"arguments"' in s:
         return True
     if '"name"' in s and ('"path"' in s or '"query"' in s or '"command"' in s or '"content"' in s):
+        return True
+    lowered = s.lower()
+    if ">tool_call" in lowered or "<tool_call" in lowered or "</tool_call" in lowered:
+        return True
+    if any(kw in lowered for kw in ("[get_current_time", "[websearch", "[webfetch", "[read_file", "[write_file", "[delete_file", "[list_files", "[shell")):
         return True
     t = s.strip()
     if t.startswith("```"):
         t = re.sub(r"^```[a-z]*\s*\n?", "", t, flags=re.IGNORECASE)
         t = re.sub(r"\n?```\s*$", "", t).strip()
-    if t.startswith("{") and '"name"' in t:
+    if t.startswith("{") and ('"name"' in t or '"function"' in t or '"tool"' in t):
         return True
     if "```json" in s and '"name"' in s:
         return True

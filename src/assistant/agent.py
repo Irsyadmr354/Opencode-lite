@@ -13,9 +13,9 @@ from .llm import LLMClient, LLMError, ToolCall  # noqa: F401  (re-exported for t
 DEFAULT_SYSTEM_PROMPT = (
     "You are Assistant, coding agent in workspace. Tools: get_current_time, "
     "websearch, webfetch, read_file, write_file, delete_file, list_files, shell. "
-    "For current/news/search: call get_current_time then websearch with date. "
-    "Always list_files '.' before read, if vague list immediately. "
-    "Be concise, no intro/outro/headers, >20 lines -> file, no JSON, use tool_calls."
+    "Never call tools for simple greetings (hi/hello). Only for news/search: "
+    "call get_current_time then websearch. Always list_files '.' before read, if vague list immediately. "
+    "Be concise, no intro/outro, >20 lines -> file, use tool_calls."
 )
 
 # Kept for backwards compat / tests — prefer config.system_prompt at runtime
@@ -45,30 +45,68 @@ _HALU_RE = re.compile(
 )
 
 
-def _sanitize_turn_content(content: str | None, config: Config | None) -> str | None:
+def _sanitize_turn_content(
+    content: str | None,
+    config: Config | None,
+    is_greeting: bool = False,
+    user_text: str = "",
+) -> str | None:
     if not content or not isinstance(content, str):
+        if is_greeting:
+            u = user_text.lower()
+            if any(k in u for k in ("halo", "hai", "selamat", "pagi", "siang", "malam", "siapa", "apa")):
+                return "Halo! Ada yang bisa saya bantu di workspace ini?"
+            return "Hello! How can I assist you today?"
         return content
-    if _HALU_RE.search(content):
+    stripped = content.strip()
+    # Check for raw tool call leak in content
+    if (
+        stripped.startswith(">tool_call")
+        or stripped.startswith("<tool_call")
+        or ">tool_calls" in stripped
+        or re.match(r"^>tool_calls?\s*\[.*\]$", stripped)
+        or (stripped.startswith("[") and stripped.endswith("]") and "get_current_time" in stripped)
+    ):
+        if is_greeting:
+            u = user_text.lower()
+            if any(k in u for k in ("halo", "hai", "selamat", "pagi", "siang", "malam", "siapa", "apa")):
+                return "Halo! Ada yang bisa saya bantu di workspace ini?"
+            return "Hello! How can I assist you today?"
+        return ""
+    # Strip any inline >tool_calls or <tool_call>...</tool_call> fragments
+    cleaned = re.sub(r">tool_calls?\s*\[[^\]]*\]", "", content, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<\/?tool_calls?>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r">tool_calls?\s*\{.*?\}", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.strip()
+
+    if not cleaned and is_greeting:
+        u = user_text.lower()
+        if any(k in u for k in ("halo", "hai", "selamat", "pagi", "siang", "malam", "siapa", "apa")):
+            return "Halo! Ada yang bisa saya bantu di workspace ini?"
+        return "Hello! How can I assist you today?"
+
+    if _HALU_RE.search(cleaned or content):
         ws = str(config.workspace) if config and hasattr(config, "workspace") else "workspace"
         ident = _resolve_identity(config, ws)
-        lowered = content.lower()
+        lowered = (cleaned or content).lower()
         if any(k in lowered for k in ("saya", "adalah", "model", "bahasa", "dibuat", "oleh")):
             return f"Assistant, coding agent di workspace {ws}. Bisa bantu baca/tulis/hapus file, list file, shell, dan websearch/webfetch."
         return f"{ident} Capabilities: read/write/delete files, list files, shell commands, websearch/webfetch."
-    return content
+    return cleaned if cleaned else content
 
-_GREETING_TOKENS = {"hi", "hello", "hey", "yo", "sup", "hiya", "howdy"}
+
+_GREETING_TOKENS = {"hi", "hello", "hey", "yo", "sup", "hiya", "howdy", "halo", "hai", "p"}
 
 
 def _is_simple_greeting(text: str) -> bool:
-    t = text.strip().lower()
+    t = text.strip().lower().rstrip("!.,? \t\r\n")
     if t in _GREETING_TOKENS:
         return True
-    # "hi" with punctuation or very short greeting phrase
-    if len(t) <= 12 and any(t.startswith(g) for g in _GREETING_TOKENS):
-        # ensure not "hi, can you read files" – if contains file/tool keywords, not greeting
-        if any(kw in t for kw in ("read", "list", "file", "search", "web", "make", "malware")):
-            return False
+    words = t.split()
+    if len(words) == 1 and words[0] in _GREETING_TOKENS:
+        return True
+    if len(words) == 2 and words[0] in _GREETING_TOKENS and words[1] in {"there", "bot", "assistant", "bro", "kawan", "teman"}:
         return True
     return False
 
@@ -196,7 +234,16 @@ class Agent:
 
     def _assistant_message(self, turn) -> dict:
         # Always set content as string - Ollama rejects null/missing content (Go <nil>)
-        content = _sanitize_turn_content(turn.content, self.config) if isinstance(turn.content, str) else ""
+        content = (
+            _sanitize_turn_content(
+                turn.content,
+                self.config,
+                is_greeting=getattr(self, "_is_greeting", False),
+                user_text=getattr(self, "_last_user_text", ""),
+            )
+            if isinstance(turn.content, str)
+            else ""
+        )
         # If model dumped tool JSON as content but also provided tool_calls, hide the JSON
         if turn.tool_calls and content:
             stripped = content.strip()
@@ -322,8 +369,10 @@ class Agent:
             elif not isinstance(m["content"], str):
                 m["content"] = str(m["content"])
         self.messages.append({"role": "user", "content": user_text})
-        self.cancelled = False
         is_greeting = _is_simple_greeting(user_text)
+        self._last_user_text = user_text
+        self._is_greeting = is_greeting
+        self.cancelled = False
         # Immediate feedback: show spinner before any network wait (TTFT)
         try:
             self.hooks.on_start()
@@ -389,8 +438,21 @@ class Agent:
             turn.stats.setdefault("ollama", None)
             turn.stats.setdefault("usage", None)
 
-            if turn.content:
-                turn.content = _sanitize_turn_content(turn.content, self.config)
+            if is_greeting:
+                turn.tool_calls = []
+                turn.content = _sanitize_turn_content(
+                    turn.content,
+                    self.config,
+                    is_greeting=True,
+                    user_text=user_text,
+                )
+            elif turn.content:
+                turn.content = _sanitize_turn_content(
+                    turn.content,
+                    self.config,
+                    is_greeting=False,
+                    user_text=user_text,
+                )
 
             self.hooks.on_assistant_done(turn)
             self.messages.append(self._assistant_message(turn))
