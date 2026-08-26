@@ -318,6 +318,7 @@ class Agent:
             pass
         flag = _CancelFlag(self)
         max_rounds = max(1, int(self.config.max_tool_rounds))
+        prev_calls: list[tuple[str, str]] = []
 
         for rnd in range(1, max_rounds + 1):
             if rnd > 1:
@@ -394,8 +395,32 @@ class Agent:
                     except Exception:
                         pass
                 return
+
             if self.cancelled:
                 return
+
+            current_calls = [(c.name, json.dumps(c.arguments, sort_keys=True)) for c in turn.tool_calls]
+            if current_calls and current_calls == prev_calls:
+                # Repeated identical tool calls detected; break loop and request conversational response
+                try:
+                    final_turn = None
+                    for event in self.client.chat_stream(self.messages, tools_schema=None, cancel=flag):
+                        if event["type"] == "delta":
+                            self.hooks.on_delta(event["text"])
+                        elif event["type"] == "reasoning":
+                            self.hooks.on_reasoning(event["text"])
+                        elif event["type"] == "final":
+                            final_turn = event["turn"]
+                    if final_turn is not None:
+                        if final_turn.content:
+                            final_turn.content = _sanitize_turn_content(final_turn.content, self.config)
+                        self.hooks.on_assistant_done(final_turn)
+                        self.messages.append(self._assistant_message(final_turn))
+                except Exception:
+                    pass
+                return
+            prev_calls = current_calls
+
             for call in turn.tool_calls:
                 if self.cancelled:
                     break

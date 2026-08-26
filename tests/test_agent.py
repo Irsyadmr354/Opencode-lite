@@ -496,3 +496,19 @@ def test_raw_tool_typo_and_leading_arrow_fallback(harness):
 
     assert len(time_tool.calls) == 1
     assert "naame" not in agent.messages[-1]["content"]
+
+
+def test_repeated_tool_call_loop_breaker(harness):
+    time_tool = StubTool(name="get_current_time")
+    hooks = RecordingHooks()
+    time_call = {
+        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_current_time", "arguments": "{}"}}],
+        "finish_reason": "tool_calls",
+    }
+    final_reply = {"content": "Hello! It is currently 2026.", "finish_reason": "stop"}
+    # Model attempts to repeat get_current_time on turn 2; loop breaker breaks it and asks for final_reply
+    agent = harness([time_call, time_call, final_reply], tools=[time_tool], hooks=hooks)
+    agent.submit("hi")
+
+    assert len(time_tool.calls) == 1
+    assert "Hello" in agent.messages[-1]["content"]

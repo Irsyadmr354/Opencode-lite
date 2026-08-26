@@ -133,6 +133,10 @@ def _is_tool_json_display(s: str) -> bool:
     t = s.strip()
     if t.startswith(">"):
         t = t.lstrip("> \t").strip()
+    if t.startswith("```json"):
+        return True
+    if t.startswith(('{"name"', '{"name":', '{"name" :', '{"naame"', '{"type"', '{"function"')):
+        return True
     if t.startswith("```"):
         t = re.sub(r"^```[a-z]*\s*\n?", "", t, flags=re.IGNORECASE)
         t = re.sub(r"\n?```\s*$", "", t).strip()

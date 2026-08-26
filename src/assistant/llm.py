@@ -88,6 +88,10 @@ def _looks_like_tool_leak(s: str) -> bool:
     t = _strip_fences(s).strip()
     if t.startswith(">"):
         t = t.lstrip("> \t").strip()
+    if t.startswith("```json"):
+        return True
+    if t.startswith(('{"name"', '{"name":', '{"name" :', '{"naame"', '{"type"', '{"function"')):
+        return True
     if t.startswith("{") and ('"name":' in t or '"name" :' in t or '"naame":' in t) and ('"arguments"' in t or '"parameters"' in t):
         return True
     return False
@@ -254,7 +258,7 @@ class LLMClient:
                             stripped = accum.strip()
                             if _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass
-                            elif stripped.startswith(("<tools", "<tool_call", ">tool_call", "[TOOL_CALL")):
+                            elif stripped.startswith(("<tools", "<tool_call", ">tool_call", "[TOOL_CALL", '{"name"', '{"name":', '{"naame"', '{"type"', '```json')):
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
@@ -300,7 +304,7 @@ class LLMClient:
                             stripped = accum.strip()
                             if _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass
-                            elif stripped.startswith(("<tools", "<tool_call", ">tool_call", "[TOOL_CALL")):
+                            elif stripped.startswith(("<tools", "<tool_call", ">tool_call", "[TOOL_CALL", '{"name"', '{"name":', '{"naame"', '{"type"', '```json')):
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
