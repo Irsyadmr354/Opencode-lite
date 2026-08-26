@@ -253,17 +253,16 @@ class LLMClient:
                         text = delta.get("content")
                         if text:
                             content_parts.append(text)
-                            # suppress raw tool JSON from streaming to UI (will be tool_calls) — aggressive
                             accum = "".join(content_parts)
+                            stripped = accum.strip()
+                            # Suppress tool JSON, XML tags, fences, or unclosed tool brackets
                             if ('"name"' in text and '"arguments"' in text) or ('"name"' in accum and '"arguments"' in accum):
-                                pass  # leaked tool JSON, hide
+                                pass
                             elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
-                                pass  # don't yield tool JSON as visible text
-                            elif accum.strip().startswith("{") and '"name"' in accum:
                                 pass
-                            elif accum.strip().startswith("```") and '"name"' in accum:
+                            elif ('"name"' in accum) or ('"function"' in accum) or ('"arguments"' in accum):
                                 pass
-                            elif "```json" in text or "```json" in accum:
+                            elif stripped.startswith(("{", "```", "<tools", "<tool_call", ">tool_call", "[TOOL_CALL")):
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
@@ -306,15 +305,14 @@ class LLMClient:
                         if text:
                             content_parts.append(text)
                             accum = "".join(content_parts)
+                            stripped = accum.strip()
                             if ('"name"' in text and '"arguments"' in text) or ('"name"' in accum and '"arguments"' in accum):
                                 pass
                             elif _looks_like_tool_json(accum) or _looks_like_tool_json(text):
                                 pass
-                            elif accum.strip().startswith("{") and '"name"' in accum:
+                            elif ('"name"' in accum) or ('"function"' in accum) or ('"arguments"' in accum):
                                 pass
-                            elif accum.strip().startswith("```") and '"name"' in accum:
-                                pass
-                            elif "```json" in text or "```json" in accum:
+                            elif stripped.startswith(("{", "```", "<tools", "<tool_call", ">tool_call", "[TOOL_CALL")):
                                 pass
                             else:
                                 yield {"type": "delta", "text": text}
@@ -344,8 +342,20 @@ class LLMClient:
                 args = {}
             if not isinstance(args, dict):
                 args = {}
+            # Unwrap any nested "arguments" wrappers
+            while isinstance(args, dict) and "arguments" in args and len(args) == 1:
+                inner = args["arguments"]
+                if isinstance(inner, dict):
+                    args = inner
+                elif isinstance(inner, str):
+                    try:
+                        args = json.loads(inner)
+                    except Exception:
+                        break
+                else:
+                    break
             tool_calls.append(ToolCall(id=slot["id"] or f"call_{index}",
-                                       name=slot["name"], arguments=args))
+                                       name=slot["name"], arguments=args if isinstance(args, dict) else {}))
 
         # If native tool_calls were not parsed from SSE, check if model dumped tool calls in content
         raw_content = "".join(content_parts)

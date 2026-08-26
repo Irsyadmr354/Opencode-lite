@@ -77,6 +77,12 @@ def _compact_json(args: Any) -> str:
 def _format_args_summary(name: str, args: dict | Any) -> str:
     if not isinstance(args, dict):
         return str(args)
+    while isinstance(args, dict) and "arguments" in args and len(args) == 1:
+        inner = args["arguments"]
+        if isinstance(inner, dict):
+            args = inner
+        else:
+            break
     if "command" in args:
         return str(args["command"])
     if "path" in args:

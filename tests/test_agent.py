@@ -458,3 +458,27 @@ def test_tools_xml_fallback_and_persona_sanitization(harness):
     assert "Claude" not in final_content
     assert "Anthropic" not in final_content
     assert "Assistant" in final_content
+
+
+def test_nested_arguments_unwrapped(harness):
+    read_tool = StubTool(name="read_file")
+    hooks = RecordingHooks()
+    nested_reply = {
+        "tool_calls": [
+            {
+                "id": "call_0",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"arguments": {"arguments": {"path": "./time_info.txt", "start_line": 1}}}',
+                },
+            }
+        ],
+        "finish_reason": "tool_calls",
+    }
+    agent = harness([nested_reply, CONTENT_REPLY], tools=[read_tool], hooks=hooks)
+    agent.submit("read file")
+
+    assert len(read_tool.calls) == 1
+    assert read_tool.calls[0]["path"] == "./time_info.txt"
+    assert read_tool.calls[0]["start_line"] == 1

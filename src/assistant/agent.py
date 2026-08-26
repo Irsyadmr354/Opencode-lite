@@ -188,15 +188,9 @@ class Agent:
     def _assistant_message(self, turn) -> dict:
         # Always set content as string - Ollama rejects null/missing content (Go <nil>)
         content = _sanitize_turn_content(turn.content, self.config) if isinstance(turn.content, str) else ""
-        # If model dumped tool JSON as content but also provided tool_calls, hide the JSON
-        if turn.tool_calls and content:
-            stripped = content.strip()
-            fenced = re.sub(r"^```[a-z]*\s*\n?", "", stripped, flags=re.IGNORECASE)
-            fenced = re.sub(r"\n?```\s*$", "", fenced).strip()
-            if fenced.startswith("{") and '"name"' in fenced and '"arguments"' in fenced:
-                content = ""
-            elif '"name"' in content and '"arguments"' in content and (content.strip().startswith("{") or content.strip().startswith("```")):
-                content = ""
+        if turn.tool_calls:
+            # If tool calls are present, this turn invoked tools; content must be empty
+            content = ""
         msg: dict = {"role": "assistant", "content": content}
         if turn.tool_calls:
             msg["tool_calls"] = [
@@ -217,6 +211,22 @@ class Agent:
                 _timings.append({"name": call.name, "duration_s": 0.0, "ok": False})
             return {"role": "tool", "tool_call_id": call.id,
                     "content": f"ERROR: unknown tool '{call.name}'"}
+
+        # Unwrap any nested "arguments" wrapper
+        args = call.arguments
+        while isinstance(args, dict) and "arguments" in args and len(args) == 1:
+            inner = args["arguments"]
+            if isinstance(inner, dict):
+                args = inner
+            elif isinstance(inner, str):
+                try:
+                    args = json.loads(inner)
+                except Exception:
+                    break
+            else:
+                break
+        call.arguments = args if isinstance(args, dict) else {}
+
         perm_key = getattr(tool, "permission_key", None)
         if perm_key is not None and hasattr(self.config.permissions, perm_key):
             perm = getattr(self.config.permissions, perm_key)
