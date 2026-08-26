@@ -44,8 +44,8 @@ def _get_live_datetime_str() -> str:
 def build_system_prompt(workspace: Path | str) -> str:
     """Build ultra-concise dynamic system prompt."""
     return (
-        f"Assistant in {workspace}. Tools: read_file, write_file, delete_file, list_files, shell, websearch, webfetch, get_current_time.\n"
-        "Reply directly. Before websearch/webfetch, call get_current_time."
+        f"Be concise. Assistant in {workspace}. Tools: read_file, write_file, delete_file, list_files, shell, websearch, webfetch, get_current_time.\n"
+        "Before websearch/webfetch, call get_current_time."
     )
 
 

@@ -30,6 +30,7 @@ def test_get_live_datetime_str():
 
 def test_build_system_prompt_date_and_workspace():
     prompt = build_system_prompt("/test/workspace")
+    assert prompt.startswith("Be concise.")
     assert "/test/workspace" in prompt
     assert "read_file" in prompt
     assert "shell" in prompt
