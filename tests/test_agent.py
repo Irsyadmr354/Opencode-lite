@@ -38,7 +38,7 @@ def test_build_system_prompt_date_and_workspace():
     assert "get_current_time" in prompt
     assert "websearch" in prompt
     assert "webfetch" in prompt
-    assert "Assistant" in prompt
+    assert "Use tools for actions, not code blocks." in prompt
     assert "Before websearch/webfetch, call get_current_time." in prompt
 
     # Dynamic custom tools
