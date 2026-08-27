@@ -13,7 +13,13 @@ from assistant.tools import get_tools, ToolResult
 from assistant.tools.shell import _resolve_shell_cmd, get_default_shell_cmd
 from assistant.tools.time import time_tool
 from assistant.tools.web import webfetch_tool, websearch_tool
-from assistant.tools.fs import read_file_tool, write_file_tool, delete_file_tool, list_files_tool
+from assistant.tools.fs import (
+    delete_file_tool,
+    list_files_tool,
+    read_file_tool,
+    view_image_tool,
+    write_file_tool,
+)
 
 
 # --- Time tool tests ---
@@ -212,3 +218,39 @@ def test_view_image_tool(tmp_path):
     res_not_found = v_tool.fn({"path": "missing.jpg"})
     assert res_not_found.ok is False
     assert "not found" in res_not_found.output
+
+
+def test_fs_tools_support_absolute_paths_outside_workspace(tmp_path):
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    cfg = Config(workspace=ws)
+    r_tool = read_file_tool(ws, cfg)
+    w_tool = write_file_tool(ws, cfg)
+    d_tool = delete_file_tool(ws, cfg)
+    v_tool = view_image_tool(ws, cfg)
+
+    # Write file outside workspace
+    outside_file = outside_dir / "external.txt"
+    res_w = w_tool.fn({"path": str(outside_file), "content": "hello outside"})
+    assert res_w.ok is True
+    assert outside_file.read_text(encoding="utf-8") == "hello outside"
+
+    # Read file outside workspace
+    res_r = r_tool.fn({"path": str(outside_file)})
+    assert res_r.ok is True
+    assert "hello outside" in res_r.output
+
+    # View image outside workspace
+    outside_img = outside_dir / "test.png"
+    outside_img.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRtest_img")
+    res_v = v_tool.fn({"path": str(outside_img)})
+    assert res_v.ok is True
+    assert "data:image_base64;image/png;" in res_v.output
+
+    # Delete file outside workspace
+    res_d = d_tool.fn({"path": str(outside_file)})
+    assert res_d.ok is True
+    assert not outside_file.exists()

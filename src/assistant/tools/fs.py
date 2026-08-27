@@ -37,15 +37,16 @@ def _outside_error(ws: pathlib.Path | None = None) -> str:
 def _resolve_in_workspace(
     workspace: pathlib.Path, raw: str
 ) -> tuple[pathlib.Path, pathlib.Path | None]:
-    """Resolve *raw* against the workspace; return (ws, target) or (ws, None) if outside."""
+    """Resolve *raw* against workspace if relative, or resolve directly if absolute."""
     ws = workspace.resolve()
     clean = str(raw).strip().strip("'\"")
     if not clean or clean == ".":
         return ws, ws
     try:
+        p = pathlib.Path(clean)
+        if p.is_absolute():
+            return ws, p.resolve()
         candidate = (ws / clean).resolve()
-        if not candidate.is_relative_to(ws):
-            return ws, None
         return ws, candidate
     except Exception:
         return ws, None
@@ -225,7 +226,10 @@ def write_file_tool(workspace: pathlib.Path, config) -> Tool:
             data = str(content).encode("utf-8")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)  # exact utf-8 bytes, no newline translation
-            rel = target.relative_to(ws).as_posix()
+            try:
+                rel = target.relative_to(ws).as_posix()
+            except ValueError:
+                rel = str(target)
             return ToolResult(True, f"OK: wrote {len(data)} bytes to {rel}")
         except Exception as exc:  # noqa: BLE001
             return ToolResult(False, f"ERROR: {exc}")
@@ -277,7 +281,10 @@ def delete_file_tool(workspace: pathlib.Path, config) -> Tool:
                     f"ERROR: '{raw_str}' is a directory",
                 )
             os.remove(target)
-            rel = target.relative_to(ws).as_posix()
+            try:
+                rel = target.relative_to(ws).as_posix()
+            except ValueError:
+                rel = str(target)
             return ToolResult(True, f"OK: deleted {rel}")
         except Exception as exc:  # noqa: BLE001
             return ToolResult(False, f"ERROR: {exc}")
@@ -346,19 +353,27 @@ def list_files_tool(workspace: pathlib.Path, config) -> Tool:
             )
             # Streaming top-k: identical result to sorted(all)[:max_entries]
             # while holding only max_entries paths in memory.
+            def _sort_key(p: pathlib.Path):
+                try:
+                    rel_str = p.relative_to(ws).as_posix().lower()
+                except ValueError:
+                    rel_str = p.as_posix().lower()
+                return (0 if p.is_dir() else 1, rel_str)
+
             matches = heapq.nsmallest(
                 max_entries,
                 _counting(candidates),
-                key=lambda p: (
-                    0 if p.is_dir() else 1,
-                    p.relative_to(ws).as_posix().lower(),
-                ),
+                key=_sort_key,
             )
 
-            lines = [
-                p.relative_to(ws).as_posix() + ("/" if p.is_dir() else "")
-                for p in matches
-            ]
+            lines = []
+            for p in matches:
+                try:
+                    p_str = p.relative_to(ws).as_posix()
+                except ValueError:
+                    p_str = p.as_posix()
+                lines.append(p_str + ("/" if p.is_dir() else ""))
+
             output = "\n".join(lines)
             hidden = total_matched - len(matches)
             if hidden > 0:
@@ -432,7 +447,10 @@ def view_image_tool(workspace: pathlib.Path, config) -> Tool:
 
             data = target.read_bytes()
             b64_data = base64.b64encode(data).decode("ascii")
-            rel = target.relative_to(ws).as_posix()
+            try:
+                rel = target.relative_to(ws).as_posix()
+            except ValueError:
+                rel = str(target)
 
             return ToolResult(
                 True,
