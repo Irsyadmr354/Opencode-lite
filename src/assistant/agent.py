@@ -141,6 +141,15 @@ class Agent:
         else:
             self.messages.insert(0, {"role": "system", "content": prompt})
 
+    def set_model(self, model_name: str) -> None:
+        """Update model in runtime agent and llm instance."""
+        self.config.model = model_name
+        self.llm.set_model(model_name)
+
+    def list_models(self) -> list[str]:
+        """Fetch available models from LLM instance."""
+        return self.llm.list_models()
+
     def clear_context(self) -> None:
         """Clear conversation history and reset system prompt."""
         self.messages.clear()

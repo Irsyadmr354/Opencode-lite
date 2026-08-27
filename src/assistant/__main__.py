@@ -28,7 +28,7 @@ def clear_screen():
 def print_banner(config):
     clear_screen()
     print(f"{CYAN}{BOLD}Assistant{RESET} {DIM}v{VERSION} · {config.model} · {config.workspace}{RESET}")
-    print(f"{DIM}commands: /sessions /clear /c-context /help exit{RESET}\n")
+    print(f"{DIM}commands: /list-model /load-model /sessions /clear /c-context /help exit{RESET}\n")
 
 
 def cmd_sessions(session, agent):
@@ -121,13 +121,86 @@ def cmd_sessions(session, agent):
             print(f"{DIM}cancelled{RESET}")
 
 
+def cmd_list_models(agent) -> list[str]:
+    """List available local models from Ollama/endpoint."""
+    models = agent.list_models()
+    if not models:
+        print(f"{YELLOW}no local models found from endpoint ({agent.config.base_url}){RESET}")
+        return []
+    print(f"\n{CYAN}--- Available Models ---{RESET}")
+    for i, m in enumerate(models, 1):
+        active = f" {GREEN}(active){RESET}" if m == agent.config.model else ""
+        print(f"  {BOLD}[{i}]{RESET} {m}{active}")
+    print()
+    return models
+
+
+def cmd_load_model(agent, target: str | None = None) -> bool:
+    """Load or switch model in the current live session."""
+    models = agent.list_models()
+    if not models:
+        print(f"{YELLOW}no local models found from endpoint ({agent.config.base_url}){RESET}")
+        return False
+
+    chosen_model = None
+    if target:
+        target_clean = target.strip()
+        # Direct index number
+        if target_clean.isdigit():
+            idx = int(target_clean) - 1
+            if 0 <= idx < len(models):
+                chosen_model = models[idx]
+        else:
+            # Match by name substring or exact
+            for m in models:
+                if m.lower() == target_clean.lower() or target_clean.lower() in m.lower():
+                    chosen_model = m
+                    break
+
+    if not chosen_model:
+        print(f"\n{CYAN}--- Load Model ---{RESET}")
+        for i, m in enumerate(models, 1):
+            active = f" {GREEN}(active){RESET}" if m == agent.config.model else ""
+            print(f"  {BOLD}[{i}]{RESET} {m}{active}")
+        print()
+        try:
+            choice = input(f"{DIM}pick number or model name: {RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"{RESET}\n{DIM}cancelled{RESET}")
+            return False
+
+        if not choice:
+            print(f"{DIM}cancelled{RESET}")
+            return False
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(models):
+                chosen_model = models[idx]
+        else:
+            for m in models:
+                if m.lower() == choice.lower() or choice.lower() in m.lower():
+                    chosen_model = m
+                    break
+
+    if not chosen_model:
+        print(f"{YELLOW}model not found{RESET}")
+        return False
+
+    agent.set_model(chosen_model)
+    print(f"{GREEN}model switched to: {BOLD}{chosen_model}{RESET}")
+    return True
+
+
 def print_help():
     print(f"\n{CYAN}--- Commands ---{RESET}")
-    print(f"  {BOLD}/sessions{RESET}  save, load, delete sessions")
-    print(f"  {BOLD}/clear{RESET}     clear screen only")
-    print(f"  {BOLD}/c-context{RESET} clear conversation context + screen")
-    print(f"  {BOLD}/help{RESET}      show this help")
-    print(f"  {BOLD}exit{RESET}       quit")
+    print(f"  {BOLD}/list-model{RESET} list available local models")
+    print(f"  {BOLD}/load-model{RESET} switch active model in live session")
+    print(f"  {BOLD}/sessions{RESET}   save, load, delete sessions")
+    print(f"  {BOLD}/clear{RESET}      clear screen only")
+    print(f"  {BOLD}/c-context{RESET}  clear conversation context + screen")
+    print(f"  {BOLD}/help{RESET}       show this help")
+    print(f"  {BOLD}exit{RESET}        quit")
     print()
 
 
@@ -212,6 +285,14 @@ def main(argv: list[str] | None = None):
                 clear_screen()
                 print_banner(config)
                 print(f"\n{GREEN}Context cleared.{RESET}")
+                continue
+            elif cmd == "/list-model" or cmd == "/list-models":
+                cmd_list_models(agent)
+                continue
+            elif cmd.startswith("/load-model") or cmd.startswith("/load-models"):
+                parts = user_input.split(maxsplit=1)
+                arg = parts[1].strip() if len(parts) > 1 else None
+                cmd_load_model(agent, arg)
                 continue
             elif cmd == "/sessions":
                 cmd_sessions(session, agent)

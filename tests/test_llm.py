@@ -588,3 +588,48 @@ def test_format_ollama_stats():
     assert "120 tok" in formatted
     assert "180.0 tok/s" in formatted
 
+
+def test_llm_set_model_and_list_models():
+    from assistant.config import Config
+    from assistant.llm import LLM
+
+    cfg = Config(model="qwen2.5-coder-3b")
+    llm = LLM(cfg)
+    assert llm.model == "qwen2.5-coder-3b"
+
+    llm.set_model("llama3.2:3b")
+    assert llm.model == "llama3.2:3b"
+
+    # Test list_models with mock OpenAI /v1/models response
+    mock_resp_v1 = mock.Mock()
+    mock_resp_v1.status_code = 200
+    mock_resp_v1.json.return_value = {
+        "data": [
+            {"id": "qwen2.5-coder-3b:latest"},
+            {"id": "llama3.2:3b:latest"},
+        ]
+    }
+    with mock.patch("httpx.Client.get", return_value=mock_resp_v1):
+        models = llm.list_models()
+        assert models == ["qwen2.5-coder-3b:latest", "llama3.2:3b:latest"]
+
+    # Test fallback to native Ollama /api/tags when /v1/models fails or is empty
+    mock_resp_tags = mock.Mock()
+    mock_resp_tags.status_code = 200
+    mock_resp_tags.json.return_value = {
+        "models": [
+            {"name": "deepseek-r1:7b"},
+            {"name": "mistral:latest"},
+        ]
+    }
+    def fake_get(url, *args, **kwargs):
+        if "models" in url:
+            r = mock.Mock()
+            r.status_code = 404
+            return r
+        return mock_resp_tags
+
+    with mock.patch("httpx.Client.get", side_effect=fake_get):
+        models = llm.list_models()
+        assert models == ["deepseek-r1:7b", "mistral:latest"]
+

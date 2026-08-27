@@ -391,6 +391,58 @@ class LLM:
         self.timeout = config.timeout_s
         self.stream = config.stream
 
+    def set_model(self, model_name: str) -> None:
+        """Dynamically update model for live session switching."""
+        self.model = model_name
+
+    def list_models(self) -> list[str]:
+        """Query Ollama/OpenAI API endpoint to get list of locally available models."""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        models: list[str] = []
+
+        # 1. Try standard OpenAI /v1/models or Ollama /v1/models
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get(f"{self.base_url}/models", headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data.get("data") if isinstance(data, dict) else data
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict) and item.get("id"):
+                                models.append(str(item["id"]))
+        except Exception:
+            pass
+
+        # 2. Fallback: Try native Ollama /api/tags if /v1/models returned empty
+        if not models:
+            try:
+                # Strip /v1 from base_url to hit root /api/tags
+                root_url = self.base_url
+                if root_url.endswith("/v1"):
+                    root_url = root_url[:-3]
+                with httpx.Client(timeout=5.0) as client:
+                    resp = client.get(f"{root_url}/api/tags")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        items = data.get("models", [])
+                        for item in items:
+                            if isinstance(item, dict) and item.get("name"):
+                                models.append(str(item["name"]))
+            except Exception:
+                pass
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_models = []
+        for m in models:
+            if m not in seen:
+                seen.add(m)
+                unique_models.append(m)
+        return unique_models
+
     def chat(self, messages: list[dict], tools: list[dict] | None = None, on_delta: Callable | None = None) -> dict:
         """Send messages to LLM, return response dict.
 

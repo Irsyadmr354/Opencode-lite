@@ -294,3 +294,33 @@ def test_verbose_cli_flags(tmp_path):
          mock.patch("sys.stdout", new=io.StringIO()) as fake_out_no_verb:
         main(["--workspace", str(tmp_path), "--no-verbose"])
         assert "10 tokens" not in fake_out_no_verb.getvalue()
+
+
+def test_interactive_list_and_load_model_commands(tmp_path):
+    mock_models = ["qwen2.5-coder-3b", "llama3.2:3b"]
+
+    # 1. Test /list-model
+    with mock.patch("builtins.input", side_effect=["/list-model", "exit"]), \
+         mock.patch("assistant.llm.LLM.list_models", return_value=mock_models), \
+         mock.patch("sys.stdout", new=io.StringIO()) as fake_out:
+        main(["--workspace", str(tmp_path)])
+        out = fake_out.getvalue()
+        assert "Available Models" in out
+        assert "qwen2.5-coder-3b" in out
+        assert "llama3.2:3b" in out
+
+    # 2. Test /load-model with argument
+    with mock.patch("builtins.input", side_effect=["/load-model llama3.2:3b", "exit"]), \
+         mock.patch("assistant.llm.LLM.list_models", return_value=mock_models), \
+         mock.patch("sys.stdout", new=io.StringIO()) as fake_out:
+        main(["--workspace", str(tmp_path)])
+        out = fake_out.getvalue()
+        assert "model switched to: \033[1mllama3.2:3b\033[0m" in out
+
+    # 3. Test interactive /load-model pick by number
+    with mock.patch("builtins.input", side_effect=["/load-model", "2", "exit"]), \
+         mock.patch("assistant.llm.LLM.list_models", return_value=mock_models), \
+         mock.patch("sys.stdout", new=io.StringIO()) as fake_out:
+        main(["--workspace", str(tmp_path)])
+        out = fake_out.getvalue()
+        assert "model switched to: \033[1mllama3.2:3b\033[0m" in out
