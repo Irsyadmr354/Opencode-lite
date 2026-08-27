@@ -56,11 +56,12 @@ DEFAULT_PROMPT = build_system_prompt(".")
 
 
 class ThinkingSpinner:
-    """Phase 1: animated spinner while waiting for LLM response or first streaming token."""
+    """Animated spinner while waiting for LLM response or executing tools."""
 
-    def __init__(self, prompt_prefix: str = "", stream: io.TextIOBase | None = None):
+    def __init__(self, message: str = "Thinking...", prompt_prefix: str = "", stream: io.TextIOBase | None = None):
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._message = message
         self._prompt_prefix = prompt_prefix
         self.stream = stream or sys.stdout
         self._started = False
@@ -80,13 +81,13 @@ class ThinkingSpinner:
         while not self._stop.is_set():
             f = frames[idx % len(frames)]
             try:
-                self.stream.write(f"\r{DIM}  {f} Thinking...{RESET}")
+                self.stream.write(f"\r{DIM}  {f} {self._message}{RESET}")
                 self.stream.flush()
             except (UnicodeEncodeError, Exception):
                 try:
                     alt_frames = ["|", "/", "-", "\\"]
                     af = alt_frames[idx % len(alt_frames)]
-                    self.stream.write(f"\r{DIM}  {af} Thinking...{RESET}")
+                    self.stream.write(f"\r{DIM}  {af} {self._message}{RESET}")
                     self.stream.flush()
                 except Exception:
                     pass
@@ -277,15 +278,37 @@ class Agent:
                     continue
 
                 safe_print(f"{DIM}  > {name}({self._preview_args(args)}){RESET}")
+                
+                # Contextual spinner message based on tool action
+                spinner_msg = f"Executing {name}..."
+                if name == "write_file":
+                    p = (args.get("path") if isinstance(args, dict) else "") or ""
+                    spinner_msg = f"Writing {p}..." if p else "Writing file..."
+                elif name == "read_file":
+                    p = (args.get("path") if isinstance(args, dict) else "") or ""
+                    spinner_msg = f"Reading {p}..." if p else "Reading file..."
+                elif name == "websearch":
+                    spinner_msg = "Searching web..."
+                elif name == "webfetch":
+                    spinner_msg = "Fetching web page..."
+                elif name == "shell":
+                    spinner_msg = "Running command..."
+                elif name == "view_image":
+                    spinner_msg = "Loading image..."
+
+                tool_spinner = ThinkingSpinner(message=spinner_msg)
+                tool_spinner.start()
                 try:
                     result = tool.fn(args if isinstance(args, dict) else {})
                     result_text = result.output
                     status = "ok" if result.ok else "FAIL"
-                    safe_print(f"{DIM}  -> {status} ({len(result_text)} chars){RESET}")
                 except Exception as exc:
                     result_text = f"Error executing tool '{name}': {exc}"
-                    safe_print(f"{DIM}  -> FAIL: {result_text}{RESET}")
+                    status = "FAIL"
+                finally:
+                    tool_spinner.stop()
 
+                safe_print(f"{DIM}  -> {status} ({len(result_text)} chars){RESET}")
                 self.messages.append({"role": "tool", "content": result_text, "tool_call_id": tc_id})
 
         # Max rounds reached without natural stop
