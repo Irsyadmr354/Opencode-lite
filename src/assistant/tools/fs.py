@@ -8,7 +8,9 @@ All tool bodies are wrapped in try/except — a Tool.fn never raises.
 """
 from __future__ import annotations
 
+import base64
 import heapq
+import mimetypes
 import os
 import pathlib
 import re
@@ -392,9 +394,76 @@ def list_files_tool(workspace: pathlib.Path, config) -> Tool:
     )
 
 
+# --- view_image --------------------------------------------------------------
+def view_image_tool(workspace: pathlib.Path, config) -> Tool:
+    """Tool for reading and inspecting image files."""
+    valid_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico", ".svg"}
+
+    def fn(args: dict) -> ToolResult:
+        try:
+            raw = args.get("path")
+            if raw is None:
+                return ToolResult(False, _MISSING.format("path"))
+            raw_str = str(raw).strip().strip("'\"")
+            if not raw_str:
+                return ToolResult(False, _MISSING.format("path"))
+            ws, target = _resolve_in_workspace(workspace, raw_str)
+            if target is None:
+                return ToolResult(False, _outside_error(ws))
+            if not target.exists():
+                return ToolResult(False, f"ERROR: not found: {raw_str}")
+            if not target.is_file():
+                return ToolResult(False, f"ERROR: not a file: {raw_str}")
+
+            ext = target.suffix.lower()
+            if ext not in valid_exts:
+                return ToolResult(
+                    False,
+                    f"ERROR: unsupported image extension '{ext}'. Supported: {', '.join(sorted(valid_exts))}",
+                )
+
+            size = target.stat().st_size
+            if size > _MAX_READ_BYTES:
+                return ToolResult(False, f"ERROR: image file too large: {size} bytes")
+
+            mime_type, _ = mimetypes.guess_type(target.name)
+            if not mime_type:
+                mime_type = "image/png" if ext == ".png" else "image/jpeg"
+
+            data = target.read_bytes()
+            b64_data = base64.b64encode(data).decode("ascii")
+            rel = target.relative_to(ws).as_posix()
+
+            return ToolResult(
+                True,
+                f"OK: image '{rel}' loaded ({size} bytes, format: {mime_type}). data:image_base64;{mime_type};{b64_data}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(False, f"ERROR: {exc}")
+
+    return Tool(
+        name="view_image",
+        description="Inspect or read an image file (PNG, JPG, WEBP, etc.) from the workspace.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Image file path relative to the workspace root.",
+                }
+            },
+            "required": ["path"],
+        },
+        danger=False,
+        fn=fn,
+        permission_key=None,
+    )
+
+
 def build_tools(workspace: pathlib.Path, config) -> list[Tool]:
     return [
         read_file_tool(workspace, config),
+        view_image_tool(workspace, config),
         write_file_tool(workspace, config),
         list_files_tool(workspace, config),
         delete_file_tool(workspace, config),

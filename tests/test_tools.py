@@ -184,3 +184,31 @@ def test_fs_list_files_filtering_and_errors(tmp_path):
     res_err = l_tool.fn({"path": "non_existent_folder"})
     assert res_err.ok is False
     assert "not found" in res_err.output
+
+
+def test_view_image_tool(tmp_path):
+    from assistant.tools.fs import view_image_tool
+
+    cfg = Config(workspace=tmp_path)
+    v_tool = view_image_tool(tmp_path, cfg)
+
+    # Valid PNG image mock
+    img_file = tmp_path / "photo.png"
+    img_file.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRtest_binary_data")
+
+    res = v_tool.fn({"path": "photo.png"})
+    assert res.ok is True
+    assert "photo.png" in res.output
+    assert "data:image_base64;image/png;" in res.output
+
+    # Unsupported extension
+    txt_file = tmp_path / "note.pdf"
+    txt_file.write_text("dummy")
+    res_unsupp = v_tool.fn({"path": "note.pdf"})
+    assert res_unsupp.ok is False
+    assert "unsupported image extension" in res_unsupp.output
+
+    # Non-existent file
+    res_not_found = v_tool.fn({"path": "missing.jpg"})
+    assert res_not_found.ok is False
+    assert "not found" in res_not_found.output

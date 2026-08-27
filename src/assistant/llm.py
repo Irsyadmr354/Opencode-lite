@@ -449,9 +449,28 @@ class LLM:
         Returns: {content, tool_calls, finish_reason, thinking, stats}
         on_delta(token, is_thinking) is called for each token chunk during streaming.
         """
+        formatted_messages = []
+        for m in messages:
+            msg_dict = dict(m)
+            content = msg_dict.get("content")
+            # If tool result contains embedded base64 image data
+            if isinstance(content, str) and "data:image_base64;" in content:
+                # Extract base64 URI
+                parts = content.split("data:image_base64;", 1)
+                desc = parts[0].strip()
+                img_info = parts[1].split(";", 1)
+                if len(img_info) == 2:
+                    mime_type, b64_str = img_info[0], img_info[1]
+                    data_uri = f"data:{mime_type};base64,{b64_str}"
+                    msg_dict["content"] = [
+                        {"type": "text", "text": desc or "Image loaded:"},
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                    ]
+            formatted_messages.append(msg_dict)
+
         body: dict = {
             "model": self.model,
-            "messages": messages,
+            "messages": formatted_messages,
             "stream": self.stream,
         }
         if self.stream:

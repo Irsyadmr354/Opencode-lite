@@ -84,14 +84,15 @@ def test_get_tools():
     assert "get_current_time" in names
     assert "webfetch" in names
     assert "websearch" in names
-    assert len(tools) == 8
+    assert "view_image" in names
+    assert len(tools) == 9
 
 
 def test_openai_schema():
     cfg = Config()
     tools = get_tools(cfg.workspace, cfg)
     schema = openai_schema(tools)
-    assert len(schema) == 8
+    assert len(schema) == 9
     assert schema[0]["type"] == "function"
     assert "name" in schema[0]["function"]
     assert "parameters" in schema[0]["function"]
