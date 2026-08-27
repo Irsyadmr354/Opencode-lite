@@ -842,6 +842,10 @@ class TypewriterStreamer:
             if not self._in_content:
                 self._safe_write(f"{BOLD}{GREEN}Assistant:{RESET} ")
                 self._in_content = True
+                # Strip leading newlines from the first token so text starts directly on the same line
+                token = token.lstrip("\r\n")
+                if not token:
+                    return
 
             self._write_chars(token)
 
