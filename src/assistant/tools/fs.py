@@ -27,12 +27,9 @@ _MISSING = "ERROR: missing argument '{}'"
 _OUTSIDE = "ERROR: path outside workspace"
 
 
-def _outside_error(ws: pathlib.Path) -> str:
-    """Helpful outside-workspace message that keeps the required substring."""
-    return (
-        f"ERROR: path outside workspace (workspace: {ws})"
-        " — use a path relative to workspace or restart with --workspace <desired-path>"
-    )
+def _outside_error(ws: pathlib.Path | None = None) -> str:
+    """Concise outside-workspace message."""
+    return "ERROR: path outside workspace — please use a relative path"
 
 
 def _resolve_in_workspace(
@@ -135,19 +132,17 @@ def read_file_tool(workspace: pathlib.Path, config) -> Tool:
             if not target.exists():
                 return ToolResult(
                     False,
-                    f"ERROR: not found: {raw_str} (workspace: {ws})",
+                    f"ERROR: not found: {raw_str}",
                 )
             if target.is_dir():
                 return ToolResult(
                     False,
-                    f"ERROR: '{raw_str}' is a directory (workspace: {ws}). "
-                    f"Call list_files with path '{raw_str}' to see contents.",
+                    f"ERROR: '{raw_str}' is a directory. Call list_files to see contents.",
                 )
             if not target.is_file():
                 return ToolResult(
                     False,
-                    f"ERROR: not a file: {raw_str} (workspace: {ws})"
-                    " — path must be relative to workspace",
+                    f"ERROR: not a file: {raw_str}",
                 )
             size = target.stat().st_size
             if size > _MAX_READ_BYTES:
@@ -223,7 +218,7 @@ def write_file_tool(workspace: pathlib.Path, config) -> Tool:
             if target.is_dir():
                 return ToolResult(
                     False,
-                    f"ERROR: cannot write: '{raw_str}' is an existing directory (workspace: {ws})",
+                    f"ERROR: cannot write: '{raw_str}' is an existing directory",
                 )
             data = str(content).encode("utf-8")
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -272,12 +267,12 @@ def delete_file_tool(workspace: pathlib.Path, config) -> Tool:
             if not target.exists():
                 return ToolResult(
                     False,
-                    f"ERROR: not found: {raw_str} (workspace: {ws})",
+                    f"ERROR: not found: {raw_str}",
                 )
             if target.is_dir():
                 return ToolResult(
                     False,
-                    f"ERROR: '{raw_str}' is a directory (workspace: {ws})",
+                    f"ERROR: '{raw_str}' is a directory",
                 )
             os.remove(target)
             rel = target.relative_to(ws).as_posix()
@@ -323,13 +318,12 @@ def list_files_tool(workspace: pathlib.Path, config) -> Tool:
             if not base.exists():
                 return ToolResult(
                     False,
-                    f"ERROR: not found: {raw_str} (workspace: {ws})",
+                    f"ERROR: not found: {raw_str}",
                 )
             if not base.is_dir():
                 return ToolResult(
                     False,
-                    f"ERROR: not a directory: {raw_str} (workspace: {ws})"
-                    " — path must be relative to workspace",
+                    f"ERROR: not a directory: {raw_str}",
                 )
 
             regex = _glob_to_regex(pattern)
