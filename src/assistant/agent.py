@@ -48,8 +48,7 @@ def build_system_prompt(workspace: Path | str, tools: list[Tool] | list[str] | N
     else:
         tool_names = "read_file, write_file, delete_file, list_files, shell, websearch, webfetch, get_current_time"
     return (
-        f"Be concise. Assistant in {workspace}. Tools: {tool_names}.\n"
-        "Use tools for actions, not raw text. Before websearch/webfetch, call get_current_time."
+        f"Available tools: {tool_names}, Use tools for actions, Don't give raw text, Before websearch/webfetch call get_current_time"
     )
 
 

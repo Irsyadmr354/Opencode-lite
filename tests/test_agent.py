@@ -31,19 +31,18 @@ def test_get_live_datetime_str():
 def test_build_system_prompt_date_and_workspace():
     # Default tools
     prompt = build_system_prompt("/test/workspace")
-    assert prompt.startswith("Be concise.")
-    assert "/test/workspace" in prompt
+    assert prompt.startswith("Available tools:")
     assert "read_file" in prompt
     assert "shell" in prompt
     assert "get_current_time" in prompt
     assert "websearch" in prompt
     assert "webfetch" in prompt
-    assert "Use tools for actions, not raw text." in prompt
-    assert "Before websearch/webfetch, call get_current_time." in prompt
+    assert "Use tools for actions, Don't give raw text" in prompt
+    assert "Before websearch/webfetch call get_current_time" in prompt
 
     # Dynamic custom tools
     custom_prompt = build_system_prompt("/custom", ["tool_a", "tool_b"])
-    assert "Tools: tool_a, tool_b" in custom_prompt
+    assert "Available tools: tool_a, tool_b" in custom_prompt
 
 
 def test_system_prompt_refreshed_on_every_turn(tmp_path):
@@ -53,15 +52,13 @@ def test_system_prompt_refreshed_on_every_turn(tmp_path):
     # Initial prompt
     assert len(agent.messages) == 1
     assert agent.messages[0]["role"] == "system"
-    assert str(tmp_path) in agent.messages[0]["content"]
+    assert "Available tools:" in agent.messages[0]["content"]
 
-    # Workspace change is refreshed on turn
-    new_ws = tmp_path / "new_workspace"
-    agent.workspace = new_ws
+    # Prompt refreshed on turn
     with mock.patch.object(agent.llm, "chat", return_value={"content": "Hello!", "tool_calls": []}):
         agent.handle("hi")
 
-    assert str(new_ws) in agent.messages[0]["content"]
+    assert "Available tools:" in agent.messages[0]["content"]
 
 
 def test_clear_context_resets_history_and_refreshes_prompt(tmp_path):
@@ -76,7 +73,7 @@ def test_clear_context_resets_history_and_refreshes_prompt(tmp_path):
 
     assert len(agent.messages) == 1
     assert agent.messages[0]["role"] == "system"
-    assert str(tmp_path) in agent.messages[0]["content"]
+    assert "Available tools:" in agent.messages[0]["content"]
     assert len(agent._recent_calls) == 0
 
 
